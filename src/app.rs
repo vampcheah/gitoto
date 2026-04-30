@@ -1078,6 +1078,8 @@ impl App {
                                 continue;
                             }
                             entry.git_op = true;
+                            self.success_message =
+                                Some((format!("Pushing {}...", entry.name), Instant::now()));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             self.spawn_git_operation(
@@ -1848,6 +1850,9 @@ impl App {
             KeyCode::Char('p') => {
                 if let Some(repo_id) = self.active_repo_id() {
                     self.action_tx.send(Action::GitPush(repo_id))?;
+                } else {
+                    self.error_message =
+                        Some(("No repository selected".to_string(), Instant::now()));
                 }
             }
             KeyCode::Char('P') => {
