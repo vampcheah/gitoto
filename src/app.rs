@@ -1,9 +1,7 @@
 use color_eyre::Result;
-use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -30,7 +28,16 @@ use crate::repo_id::RepoId;
 use crate::tui::Tui;
 use crate::watcher::RepoWatcher;
 
+mod git_ops;
+mod helpers;
+mod input;
 mod perf;
+mod ui;
+
+use helpers::{
+    ActiveWorktree, StatusFailure, StatusGuard, StatusQuery, base64_encode, git_args,
+    is_valid_github_repo_name, open_browser_url,
+};
 
 const HELP_PAGE_COUNT: usize = 5;
 
@@ -52,117 +59,6 @@ impl SortOrder {
         match self {
             Self::Alphabetical => Self::DirtyFirst,
             Self::DirtyFirst => Self::Alphabetical,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum StatusQuery {
-    Local,
-    Fetch,
-}
-
-#[derive(Clone, Copy)]
-enum StatusFailure {
-    UserVisible,
-    Debug(&'static str),
-}
-
-fn git_args(args: &[&str]) -> Vec<String> {
-    args.iter().map(|arg| (*arg).to_string()).collect()
-}
-
-fn open_browser_url(url: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = std::process::Command::new("open");
-        command.arg(url);
-        command
-    };
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", "", url]);
-        command
-    };
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = {
-        let mut command = std::process::Command::new("xdg-open");
-        command.arg(url);
-        command
-    };
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-}
-
-/// RAII guard that sends `StatusQueryDone` if the spawned task exits
-/// without sending a completion message (e.g., on panic). The guard's
-/// `Drop` uses `UnboundedSender::send` which is non-blocking, so it
-/// is safe to call from a synchronous `Drop`.
-struct StatusGuard {
-    id: RepoId,
-    tx: UnboundedSender<Action>,
-    completed: bool,
-}
-
-impl StatusGuard {
-    fn new(id: RepoId, tx: UnboundedSender<Action>) -> Self {
-        Self {
-            id,
-            tx,
-            completed: false,
-        }
-    }
-
-    /// Mark the guard as completed so `Drop` won't send cleanup.
-    /// Consumes self to prevent accidental reuse.
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for StatusGuard {
-    fn drop(&mut self) {
-        if !self.completed {
-            let _ = self.tx.send(Action::StatusQueryDone(self.id.clone()));
-        }
-    }
-}
-
-/// RAII guard for git operations (push/pull/submodule) that set `git_op = true`.
-/// If the spawned task panics without sending `GitOpComplete` or `RefreshRepo`,
-/// the guard sends `RefreshRepo` to trigger a status query that clears `git_op`.
-struct GitOpGuard {
-    id: RepoId,
-    tx: UnboundedSender<Action>,
-    completed: bool,
-}
-
-impl GitOpGuard {
-    fn new(id: RepoId, tx: UnboundedSender<Action>) -> Self {
-        Self {
-            id,
-            tx,
-            completed: false,
-        }
-    }
-
-    fn complete(mut self) {
-        self.completed = true;
-    }
-}
-
-impl Drop for GitOpGuard {
-    fn drop(&mut self) {
-        if !self.completed {
-            let _ = self.tx.send(Action::RefreshRepo(self.id.clone()));
         }
     }
 }
@@ -222,14 +118,6 @@ pub(crate) struct App {
     /// When a worktree row is selected, stores context for diff/status routing
     /// and live-polling the worktree's changes.
     active_worktree: Option<ActiveWorktree>,
-}
-
-#[derive(Clone)]
-struct ActiveWorktree {
-    path: PathBuf,
-    repo_id: RepoId,
-    display_name: String,
-    graph_key: Option<String>,
 }
 
 impl App {
@@ -474,40 +362,6 @@ impl App {
                 }
             })
             .await
-        });
-    }
-
-    fn spawn_git_operation<F, M>(
-        &self,
-        repo_id: RepoId,
-        operation: F,
-        success_message: M,
-        error_context: Option<&'static str>,
-    ) where
-        F: FnOnce() -> Result<String> + Send + 'static,
-        M: FnOnce(String) -> String + Send + 'static,
-    {
-        let tx = self.action_tx.clone();
-        tokio::task::spawn_blocking(move || {
-            let guard = GitOpGuard::new(repo_id.clone(), tx.clone());
-            match operation() {
-                Ok(output) => {
-                    guard.complete();
-                    let _ = tx.send(Action::GitOpComplete {
-                        id: repo_id,
-                        message: success_message(output),
-                    });
-                }
-                Err(e) => {
-                    guard.complete();
-                    let message = match error_context {
-                        Some(context) => format!("{context}: {e}"),
-                        None => format!("{e}"),
-                    };
-                    let _ = tx.send(Action::Notice(message));
-                    let _ = tx.send(Action::RefreshRepo(repo_id));
-                }
-            }
         });
     }
 
@@ -1100,6 +954,9 @@ impl App {
                                 .map(|s| s.branch.clone())
                                 .unwrap_or_default();
                             entry.git_op = true;
+                            let publish_target = entry.display_name();
+                            self.success_message =
+                                Some((format!("Publishing {publish_target}..."), Instant::now()));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             let success_branch = branch.clone();
@@ -1119,11 +976,15 @@ impl App {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &mut self.repo_list.repos[idx];
                             entry.git_op = true;
+                            let visibility = if private { "private" } else { "public" };
+                            self.success_message = Some((
+                                format!("Creating {visibility} GitHub repo {name}..."),
+                                Instant::now(),
+                            ));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             let repo_name = name.clone();
                             let success_name = name.clone();
-                            let visibility = if private { "private" } else { "public" };
                             self.spawn_git_operation(
                                 repo_id,
                                 move || crate::git::create_github_repo(&path, &repo_name, private),
@@ -1192,6 +1053,21 @@ impl App {
                                 git_args.push(branch);
                             }
                             entry.git_op = true;
+                            let display_name = entry.display_name();
+                            let progress = match action {
+                                Action::GitPull(_) => format!("Pulling {display_name}..."),
+                                Action::RunGitPullRebase(_) => {
+                                    format!("Rebasing {display_name}...")
+                                }
+                                Action::RunGitPullSubmodules(_) => {
+                                    format!("Pulling submodules for {display_name}...")
+                                }
+                                Action::RunRemoveOriginRemote(_) => {
+                                    format!("Removing origin from {display_name}...")
+                                }
+                                _ => unreachable!(),
+                            };
+                            self.success_message = Some((progress, Instant::now()));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             let success = format!("git {} succeeded", git_args.join(" "));
@@ -1233,6 +1109,20 @@ impl App {
                                 _ => unreachable!(),
                             };
                             entry.git_op = true;
+                            let display_name = entry.display_name();
+                            let progress = match action {
+                                Action::GitSubmoduleUpdate(_) => {
+                                    format!("Updating submodules for {display_name}...")
+                                }
+                                Action::GitSubmoduleSync(_) => {
+                                    format!("Syncing submodules for {display_name}...")
+                                }
+                                Action::RunGitSubmoduleUpdateLatest(_) => {
+                                    format!("Pulling latest in submodules for {display_name}...")
+                                }
+                                _ => unreachable!(),
+                            };
+                            self.success_message = Some((progress, Instant::now()));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             let success = format!("git {} succeeded", git_args.join(" "));
@@ -1674,336 +1564,6 @@ impl App {
         Ok(())
     }
 
-    fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.action_tx.send(Action::Quit)?;
-            return Ok(());
-        }
-
-        // Notice dialog gets top priority
-        if self.notice_dialog.visible {
-            let _ = self.notice_dialog.handle_key_event(key)?;
-            return Ok(());
-        }
-
-        // Confirm dialog gets top priority
-        if self.confirm_dialog.visible {
-            if let Some(action) = self.confirm_dialog.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
-            return Ok(());
-        }
-
-        // Path input gets priority
-        if self.path_input.visible {
-            if let Some(action) = self.path_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
-            return Ok(());
-        }
-
-        // Commit message input gets priority over panel shortcuts.
-        if self.commit_input.visible {
-            if let Some(action) = self.commit_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
-            return Ok(());
-        }
-
-        // GitHub repository name input gets priority over panel shortcuts.
-        if self.github_repo_input.visible {
-            if let Some(action) = self.github_repo_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
-            return Ok(());
-        }
-
-        // Search input gets priority when active
-        if self.focus == FocusPanel::Graph && self.git_graph.search_visible() {
-            self.git_graph.handle_search_key(key)?;
-            return Ok(());
-        }
-
-        // Context menu gets priority
-        if self.context_menu.visible {
-            if let Some(action) = self.context_menu.handle_key_event(key)? {
-                if matches!(action, Action::HideContextMenu) {
-                    // fall through to normal handling
-                } else {
-                    self.action_tx.send(action)?;
-                    return Ok(());
-                }
-            } else {
-                return Ok(());
-            }
-        }
-
-        if self.show_help {
-            match key.code {
-                KeyCode::Tab => {
-                    self.help_page = (self.help_page + 1) % HELP_PAGE_COUNT;
-                }
-                KeyCode::BackTab => {
-                    self.help_page = (self.help_page + HELP_PAGE_COUNT - 1) % HELP_PAGE_COUNT;
-                }
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Char('?') => {
-                    self.show_help = false;
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-
-        if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('?')) {
-            self.show_help = true;
-            self.help_page = 0;
-            return Ok(());
-        }
-
-        if self.show_operation_log {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => {
-                    self.show_operation_log = false;
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-
-        match key.code {
-            KeyCode::Char('q') => {
-                // If viewing diff, close it instead of quitting
-                if self.focus == FocusPanel::Changes && self.file_list.viewing_diff() {
-                    self.file_list.handle_key_event(key)?;
-                    return Ok(());
-                }
-                self.action_tx.send(Action::Quit)?;
-            }
-            KeyCode::Esc => {
-                // Close active detail/diff first, then navigate panels
-                if self.focus == FocusPanel::Changes && self.file_list.viewing_diff() {
-                    self.file_list.handle_key_event(key)?;
-                } else if self.focus == FocusPanel::Graph && self.git_graph.has_detail() {
-                    self.git_graph.handle_key_event(key)?;
-                } else if self.focused_repo.take().is_some() {
-                    self.focus = FocusPanel::Repos;
-                } else {
-                    match self.focus {
-                        FocusPanel::Graph => self.focus = FocusPanel::Changes,
-                        FocusPanel::Changes => self.focus = FocusPanel::Repos,
-                        FocusPanel::Repos => self.action_tx.send(Action::Quit)?,
-                    }
-                }
-            }
-            KeyCode::Tab => {
-                // Cycle focus right
-                self.focus = if self.focused_repo.is_some() {
-                    match self.focus {
-                        FocusPanel::Changes => FocusPanel::Graph,
-                        _ => FocusPanel::Changes,
-                    }
-                } else {
-                    match self.focus {
-                        FocusPanel::Repos => FocusPanel::Changes,
-                        FocusPanel::Changes => FocusPanel::Graph,
-                        FocusPanel::Graph => FocusPanel::Repos,
-                    }
-                };
-            }
-            KeyCode::BackTab => {
-                // Cycle focus left
-                self.focus = if self.focused_repo.is_some() {
-                    match self.focus {
-                        FocusPanel::Graph => FocusPanel::Changes,
-                        _ => FocusPanel::Graph,
-                    }
-                } else {
-                    match self.focus {
-                        FocusPanel::Repos => FocusPanel::Graph,
-                        FocusPanel::Changes => FocusPanel::Repos,
-                        FocusPanel::Graph => FocusPanel::Changes,
-                    }
-                };
-            }
-            KeyCode::Char('r') => {
-                self.action_tx.send(Action::RefreshAll)?;
-            }
-            KeyCode::Char('R') => {
-                self.action_tx.send(Action::RescanRepos)?;
-            }
-            KeyCode::Char('F') => {
-                self.action_tx.send(Action::ToggleFastMode)?;
-            }
-            KeyCode::Char('o') => {
-                self.action_tx.send(Action::ToggleOperationLog)?;
-            }
-            KeyCode::Char('g') => {
-                self.action_tx.send(Action::ShowGitGraph)?;
-            }
-            KeyCode::Char('a') => {
-                self.action_tx.send(Action::OpenAddRepo)?;
-            }
-            KeyCode::Char('c') if self.focus != FocusPanel::Graph => {
-                if let Some(repo_id) = self.active_repo_id() {
-                    self.action_tx.send(Action::StartCommit(repo_id))?;
-                }
-            }
-            KeyCode::Char('p') => {
-                if let Some(repo_id) = self.active_repo_id() {
-                    self.action_tx.send(Action::GitPush(repo_id))?;
-                } else {
-                    self.error_message =
-                        Some(("No repository selected".to_string(), Instant::now()));
-                }
-            }
-            KeyCode::Char('P') => {
-                if let Some(repo_id) = self.active_repo_id() {
-                    self.action_tx.send(Action::GitPublish(repo_id))?;
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(repo_id) = self.active_repo_id()
-                    && let Some(idx) = self.repo_list.resolve_index(&repo_id)
-                {
-                    let entry = &self.repo_list.repos[idx];
-                    let name = entry.name.clone();
-                    self.confirm_dialog
-                        .show(format!("Remove {}?", name), Action::RemoveRepo(repo_id));
-                }
-            }
-            KeyCode::Char('s') => {
-                self.action_tx.send(Action::CycleSortOrder)?;
-            }
-            KeyCode::Char('y') => {
-                // Copy selected item to clipboard (OSC 52)
-                let text = match self.focus {
-                    FocusPanel::Repos => self
-                        .repo_list
-                        .selected_repo()
-                        .map(|e| e.path.to_string_lossy().to_string()),
-                    FocusPanel::Changes => self.file_list.selected_path(),
-                    FocusPanel::Graph => self.git_graph.selected_text(),
-                };
-                if let Some(text) = text {
-                    use std::io::Write;
-                    let encoded = base64_encode(text.as_bytes());
-                    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", encoded);
-                    let _ = std::io::stdout().flush();
-                }
-            }
-            _ => {
-                // Route to focused panel
-                match self.focus {
-                    FocusPanel::Repos => {
-                        if let Some(action) = self.repo_list.handle_key_event(key)? {
-                            self.action_tx.send(action)?;
-                        }
-                    }
-                    FocusPanel::Changes => {
-                        if let Some(action) = self.file_list.handle_key_event(key)? {
-                            self.action_tx.send(action)?;
-                        }
-                    }
-                    FocusPanel::Graph => {
-                        if let Some(action) = self.git_graph.handle_key_event(key)? {
-                            self.action_tx.send(action)?;
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
-        use crossterm::event::{MouseButton, MouseEventKind};
-
-        if self.context_menu.visible {
-            if let Some(action) = self.context_menu.handle_mouse_event(mouse)? {
-                self.action_tx.send(action)?;
-            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.context_menu.hide();
-            }
-            return Ok(());
-        }
-
-        let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-        const GRAB_ZONE: u16 = 2; // ±2 cells hit zone for border grab
-
-        // Border dragging for vertical panel resize.
-        if self.repo_area.width > 0 {
-            let border1 = self.repo_area.y + self.repo_area.height;
-            let border2 = self.changes_area.y + self.changes_area.height;
-            let mouse_pos = mouse.row;
-            let total = self.repo_area.height + self.changes_area.height + self.graph_area.height;
-            let origin = self.repo_area.y;
-
-            match mouse.kind {
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let d1 = mouse_pos.abs_diff(border1);
-                    let d2 = mouse_pos.abs_diff(border2);
-                    if d1 <= GRAB_ZONE && (d1 <= d2 || d2 > GRAB_ZONE) {
-                        self.dragging_border = Some(0);
-                    } else if d2 <= GRAB_ZONE {
-                        self.dragging_border = Some(1);
-                    } else {
-                        self.dragging_border = None;
-                    }
-                    // Don't return — let the click propagate to panels
-                    // so items near borders remain clickable. The drag
-                    // will only engage on MouseEventKind::Drag.
-                }
-                MouseEventKind::Drag(MouseButton::Left) if self.dragging_border.is_some() => {
-                    let rel = mouse_pos.saturating_sub(origin) as f64 / total as f64;
-                    let min_f = 3.0 / total as f64;
-                    match self.dragging_border {
-                        Some(0) => {
-                            self.border_frac[0] = rel.clamp(min_f, self.border_frac[1] - min_f);
-                        }
-                        Some(1) => {
-                            self.border_frac[1] =
-                                rel.clamp(self.border_frac[0] + min_f, 1.0 - min_f);
-                        }
-                        _ => {}
-                    }
-                    return Ok(());
-                }
-                MouseEventKind::Up(MouseButton::Left) if self.dragging_border.is_some() => {
-                    self.dragging_border = None;
-                    return Ok(());
-                }
-                _ => {}
-            }
-        }
-
-        // Set focus on left click based on which panel was clicked
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if self.repo_area.contains(pos) && self.focused_repo.is_none() {
-                self.focus = FocusPanel::Repos;
-            } else if self.changes_area.contains(pos) {
-                self.focus = FocusPanel::Changes;
-            } else if self.graph_area.contains(pos) {
-                self.focus = FocusPanel::Graph;
-            }
-        }
-
-        // Route to the panel under the mouse
-        if self.repo_area.contains(pos) {
-            if let Some(action) = self.repo_list.handle_mouse_event(mouse)? {
-                self.action_tx.send(action)?;
-            }
-        } else if self.changes_area.contains(pos) {
-            if let Some(action) = self.file_list.handle_mouse_event(mouse)? {
-                self.action_tx.send(action)?;
-            }
-        } else if self.graph_area.contains(pos)
-            && let Some(action) = self.git_graph.handle_mouse_event(mouse)?
-        {
-            self.action_tx.send(action)?;
-        }
-        Ok(())
-    }
-
     fn draw(&mut self, frame: &mut ratatui::Frame) -> Result<()> {
         let area = frame.area();
 
@@ -2099,250 +1659,4 @@ impl App {
 
         Ok(())
     }
-}
-
-impl App {
-    fn draw_operation_log(&self, frame: &mut ratatui::Frame, area: Rect) {
-        use ratatui::style::{Color, Style};
-        use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-
-        let width = 84u16.min(area.width.saturating_sub(4)).max(30);
-        let height = 14u16.min(area.height.saturating_sub(2)).max(6);
-        let x = area.x + (area.width.saturating_sub(width)) / 2;
-        let y = area.y + (area.height.saturating_sub(height)) / 2;
-        let rect = Rect::new(x, y, width, height);
-        let max_lines = height.saturating_sub(2) as usize;
-
-        let mut lines: Vec<Line> = self
-            .operation_log
-            .iter()
-            .rev()
-            .take(max_lines.saturating_sub(1))
-            .map(|entry| Line::from(Span::raw(entry.clone())))
-            .collect();
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "No operations yet",
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        lines.push(Line::from(Span::styled(
-            "Esc/o closes",
-            Style::default().fg(Color::DarkGray),
-        )));
-
-        let block = Block::default()
-            .title(" Operation Log ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
-                .wrap(Wrap { trim: false }),
-            rect,
-        );
-    }
-
-    fn draw_update_notification(&self, frame: &mut ratatui::Frame, area: Rect, version: &str) {
-        use ratatui::style::{Color, Style};
-        use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph};
-
-        let text = format!(" \u{2191} v{version} \u{00b7} cargo install gitoto ");
-        let width = text.len() as u16 + 2; // +2 for border
-        let height = 3; // top border + content + bottom border
-
-        if area.width < width || area.height < height {
-            return;
-        }
-
-        let x = match self.update_position {
-            UpdatePosition::TopRight => area.x + area.width.saturating_sub(width + 1),
-            UpdatePosition::TopLeft => area.x + 1,
-        };
-        let y = area.y;
-
-        let rect = Rect::new(x, y, width, height);
-
-        let line = Line::from(vec![
-            Span::styled(" \u{2191} ", Style::default().fg(Color::Green)),
-            Span::styled(format!("v{version}"), Style::default().fg(Color::Yellow)),
-            Span::styled(
-                " \u{00b7} cargo install gitoto ",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
-
-        let paragraph = Paragraph::new(line).block(block);
-
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(paragraph, rect);
-    }
-
-    fn draw_help(&self, frame: &mut ratatui::Frame, area: Rect) {
-        use ratatui::style::{Color, Style};
-        use ratatui::text::{Line, Span};
-        use ratatui::widgets::{Block, Borders, Paragraph};
-
-        fn key(k: &str) -> Span<'static> {
-            Span::styled(format!("  {k:<14}"), Style::default().fg(Color::Yellow))
-        }
-        fn desc(d: &str) -> Span<'static> {
-            Span::raw(d.to_string())
-        }
-        fn item(k: &str, d: &str) -> Line<'static> {
-            Line::from(vec![key(k), desc(d)])
-        }
-        fn note(text: &str) -> Line<'static> {
-            Line::from(Span::styled(
-                format!(" {text}"),
-                Style::default().fg(Color::DarkGray),
-            ))
-        }
-
-        let pages: Vec<(&str, Vec<Line<'static>>)> = vec![
-            (
-                "Global",
-                vec![
-                    item("h / ?", "Open or close this help"),
-                    item("Tab", "Next help page while help is open"),
-                    item("Shift+Tab", "Previous help page while help is open"),
-                    item("Esc / q", "Close help, close current view, or quit"),
-                    item("Ctrl+C", "Quit immediately"),
-                    item("Tab", "Cycle focus when help is closed"),
-                    item("r", "Refresh all repo statuses"),
-                    item("R", "Rescan configured directories"),
-                    item("F", "Toggle fast mode"),
-                    item("o", "Show operation log"),
-                    item("g", "Reload graph for selected repo"),
-                    item("a", "Add a repository path"),
-                    item("y", "Copy selected item to clipboard"),
-                ],
-            ),
-            (
-                "Repositories",
-                vec![
-                    item("j / Down", "Select next repo or worktree"),
-                    item("k / Up", "Select previous repo or worktree"),
-                    item("Enter", "Focus selected repo in Changes and Graph"),
-                    item("w", "Toggle linked worktrees"),
-                    item("c", "Commit all changes in selected repo"),
-                    item("p", "Push selected repo when upstream exists"),
-                    item("P", "Publish branch with git push -u origin"),
-                    item("d", "Remove repo from gitoto after confirmation"),
-                    item("s", "Cycle sort order"),
-                    item("Right click", "Open repo context menu"),
-                    item("Wheel", "Move selection"),
-                ],
-            ),
-            (
-                "Changes",
-                vec![
-                    item("j / Down", "Select next changed file"),
-                    item("k / Up", "Select previous changed file"),
-                    item("Enter", "Open split diff view"),
-                    item("Esc / Left", "Close diff view"),
-                    item("c", "Commit selected repo"),
-                    item("p", "Push selected repo"),
-                    item("P", "Publish selected branch"),
-                    item("Wheel", "Scroll diff or file list"),
-                ],
-            ),
-            (
-                "Graph",
-                vec![
-                    item("j / Down", "Select next commit or file"),
-                    item("k / Up", "Select previous commit or file"),
-                    item("Left / Right", "Scroll graph horizontally"),
-                    item("Enter", "Open commit files or file diff"),
-                    item("Esc / Left", "Close commit diff/detail"),
-                    item("/", "Search commits"),
-                    item("n / N", "Next or previous search result"),
-                    item("f", "Toggle first-parent mode"),
-                    item("c", "Collapse or expand branch"),
-                    item("H", "Expand all collapsed branches"),
-                ],
-            ),
-            (
-                "Legend And Menu",
-                vec![
-                    item("*", "Repo has uncommitted changes"),
-                    item("↑ / ↓", "Commits ahead / behind upstream"),
-                    item("[n]", "Changed file count"),
-                    item("~", "Git operation in progress"),
-                    item("Red dot", "Commit is not on a GitHub remote"),
-                    item("Green dot", "Commit is on a GitHub remote"),
-                    item("Private repo", "Context menu creates GitHub private repo"),
-                    item("Public repo", "Context menu creates GitHub public repo"),
-                    note("GitHub repo creation requires gh auth login."),
-                ],
-            ),
-        ];
-
-        let page_count = pages.len();
-        let page_idx = self.help_page.min(page_count.saturating_sub(1));
-        let (title, mut lines) = pages[page_idx].clone();
-        lines.push(Line::from(""));
-        lines.push(note("Tab/Shift+Tab pages. Esc/q/h closes help."));
-
-        let height = (lines.len() as u16 + 2).min(area.height);
-        let width = 64u16.min(area.width);
-        let x = area.x + (area.width.saturating_sub(width)) / 2;
-        let y = area.y + (area.height.saturating_sub(height)) / 2;
-        let help_area = Rect::new(x, y, width, height);
-
-        let block = Block::default()
-            .title(format!(
-                " Help {}/{} - {} ",
-                page_idx + 1,
-                page_count,
-                title
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .style(Style::default().bg(Color::Black));
-
-        frame.render_widget(ratatui::widgets::Clear, help_area);
-        let paragraph = Paragraph::new(lines).block(block);
-        frame.render_widget(paragraph, help_area);
-    }
-}
-
-/// Simple base64 encoder for OSC 52 clipboard
-fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[(n >> 18 & 0x3f) as usize] as char);
-        result.push(CHARS[(n >> 12 & 0x3f) as usize] as char);
-        if chunk.len() > 1 {
-            result.push(CHARS[(n >> 6 & 0x3f) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        if chunk.len() > 2 {
-            result.push(CHARS[(n & 0x3f) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    result
-}
-
-fn is_valid_github_repo_name(name: &str) -> bool {
-    !name.is_empty()
-        && !name.starts_with('.')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }

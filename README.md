@@ -32,25 +32,12 @@ This fork shifts the experience closer to VS Code Source Control for multiple re
 
 ![gitoto operation log](assets/screenshot-operation-log.png)
 
-## Install
+## Quick Start
 
 From this repository:
 
 ```bash
 cargo install --path .
-```
-
-This installs the binary as:
-
-```bash
-gitoto
-```
-
-Creating GitHub repositories from the context menu requires GitHub CLI:
-
-```bash
-gh auth login
-gh auth setup-git
 ```
 
 Run it from the folder you want to scan:
@@ -71,7 +58,35 @@ Start in fast mode for very large repo sets:
 gitoto --fast
 ```
 
-## What Changed From gitpane
+## GitHub Integration
+
+The repo context menu can open the GitHub page, create a private or public GitHub repo when no GitHub remote exists, and remove `origin` after confirmation.
+
+Creating GitHub repositories from the context menu requires GitHub CLI:
+
+```bash
+gh auth login
+gh auth setup-git
+```
+
+## Release Version
+
+Bump the package version, refresh `Cargo.lock`, run checks, and commit the version change:
+
+```bash
+./scripts/bump-version patch
+./scripts/bump-version minor
+./scripts/bump-version major
+```
+
+Optional flags:
+
+```bash
+./scripts/bump-version patch --tag
+./scripts/bump-version patch --no-verify
+```
+
+## Key Workflows
 
 - `c` opens a commit message input for the selected repo.
 - `Enter` in commit input runs `git add .` and `git commit -m "<message>"`.
@@ -81,6 +96,12 @@ gitoto --fast
 - `P` publishes the selected branch with `git push -u origin <branch>`.
 - The repo context menu can open the GitHub page, create a private or public GitHub repository when no GitHub remote exists, and remove `origin` with confirmation.
 - Commit, push, publish, and GitHub repository creation failures are shown in the status bar.
+
+## What Changed From gitpane
+
+- The workflow is centered on VS Code-style source control for one or many repos.
+- Repo rows show clearer names using local folder and GitHub repo names.
+- Git operations provide explicit in-progress and completion feedback.
 - The original dashboard, file list, diff view, commit graph, worktree handling, ahead/behind status, and context menu are preserved.
 - `rustls-webpki` is locked to a patched version, and CI includes dependency auditing.
 

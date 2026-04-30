@@ -18,44 +18,11 @@ use crate::components::Component;
 use crate::git::graph::{BranchSegment, GraphBuilder, GraphOptions, GraphRow};
 use crate::git::graph_render;
 
-struct CommitDetail {
-    oid: String,
-    message: String,
-    files: Vec<(String, String)>,
-    file_state: ListState,
-    diff_content: Option<String>,
-    diff_scroll: u16,
-    msg_scroll: u16,
-    /// Rendered rect for the commit message block (set during draw).
-    msg_area: Rect,
-    /// Rendered rect for the file list block (set during draw).
-    file_list_area: Rect,
-}
-
-struct SearchState {
-    visible: bool,
-    input: String,
-    matches: Vec<usize>,
-    current_match: Option<usize>,
-}
-
-impl SearchState {
-    fn new() -> Self {
-        Self {
-            visible: false,
-            input: String::new(),
-            matches: Vec::new(),
-            current_match: None,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.visible = false;
-        self.input.clear();
-        self.matches.clear();
-        self.current_match = None;
-    }
-}
+mod collapse;
+mod detail;
+mod search;
+use detail::CommitDetail;
+use search::SearchState;
 
 pub(crate) struct GitGraph {
     /// Display rows (may contain collapsed placeholders).
@@ -451,48 +418,8 @@ impl GitGraph {
             return;
         }
 
-        // Collect all hidden row indices and prepare placeholders
-        let mut hidden: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        // (tip_row_idx, segment_id, display_name, count)
-        let mut placeholders: Vec<(usize, String, String, usize)> = Vec::new();
-
-        for seg in &self.segments {
-            if !self.collapsed_branches.contains(&seg.id) {
-                continue;
-            }
-            for &row_idx in &seg.row_indices {
-                hidden.insert(row_idx);
-            }
-            let tip_idx = seg.row_indices[0];
-            placeholders.push((
-                tip_idx,
-                seg.id.clone(),
-                seg.display_name.clone(),
-                seg.row_indices.len(),
-            ));
-        }
-
-        let mut rows = Vec::new();
-        for (i, row) in self.all_rows.iter().enumerate() {
-            if hidden.contains(&i) {
-                if let Some((_, seg_id, name, count)) =
-                    placeholders.iter().find(|(tip, _, _, _)| *tip == i)
-                {
-                    let mut placeholder = row.clone();
-                    placeholder.message = format!("\u{25b6} {name} ({count} commits)");
-                    placeholder.short_id = String::new();
-                    placeholder.author = String::new();
-                    placeholder.labels = Vec::new();
-                    placeholder.diff_stat = None;
-                    placeholder.collapsed = Some((seg_id.clone(), *count));
-                    rows.push(placeholder);
-                }
-                continue;
-            }
-            rows.push(row.clone());
-        }
-
-        self.rows = rows;
+        self.rows =
+            collapse::collapsed_rows(&self.all_rows, &self.segments, &self.collapsed_branches);
     }
 
     pub fn selected_text(&self) -> Option<String> {
@@ -540,51 +467,20 @@ impl GitGraph {
     }
 
     fn update_search_matches(&mut self) {
-        self.search.current_match = None;
-        if self.search.input.is_empty() {
-            self.search.matches.clear();
-            return;
-        }
-        let query = self.search.input.to_lowercase();
-        let matches: Vec<usize> = self
-            .display_rows()
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.message.to_lowercase().contains(&query)
-                    || row.author.to_lowercase().contains(&query)
-                    || row.short_id.to_lowercase().contains(&query)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        if !matches.is_empty() {
-            self.search.current_match = Some(0);
-        }
-        self.search.matches = matches;
+        let matches = search::matching_rows(&self.search.input, self.display_rows());
+        self.search.set_matches(matches);
     }
 
     fn search_next(&mut self) {
-        if self.search.matches.is_empty() {
-            return;
+        if let Some(idx) = self.search.next_match() {
+            self.state.select(Some(idx));
         }
-        let next = match self.search.current_match {
-            Some(i) => (i + 1) % self.search.matches.len(),
-            None => 0,
-        };
-        self.search.current_match = Some(next);
-        self.state.select(Some(self.search.matches[next]));
     }
 
     fn search_prev(&mut self) {
-        if self.search.matches.is_empty() {
-            return;
+        if let Some(idx) = self.search.prev_match() {
+            self.state.select(Some(idx));
         }
-        let prev = match self.search.current_match {
-            Some(0) | None => self.search.matches.len() - 1,
-            Some(i) => i - 1,
-        };
-        self.search.current_match = Some(prev);
-        self.state.select(Some(self.search.matches[prev]));
     }
 
     fn select_next(&mut self) {
@@ -977,10 +873,7 @@ impl Component for GitGraph {
                 Ok(None)
             }
             KeyCode::Char('/') => {
-                self.search.visible = true;
-                self.search.input.clear();
-                self.search.matches.clear();
-                self.search.current_match = None;
+                self.search.open();
                 Ok(None)
             }
             KeyCode::Char('j') | KeyCode::Down => {

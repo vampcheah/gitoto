@@ -27,21 +27,73 @@ pub(crate) struct RepoEntry {
 
 impl RepoEntry {
     pub(crate) fn display_name(&self) -> String {
-        let folder = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| self.name.clone().into());
+        let folder = self.folder_name();
+        match self.remote_repo_name() {
+            Some(repo_name) => format!("{folder}:{repo_name}"),
+            None => folder,
+        }
+    }
 
-        let repo_name = self
-            .status
+    fn display_name_with_parent_fallback(&self) -> String {
+        let folder = self.folder_name();
+        match self.remote_repo_name() {
+            Some(repo_name) => format!("{folder}:{repo_name}"),
+            None => match self.parent_folder_name() {
+                Some(parent) => format!("{parent}:{folder}"),
+                None => folder,
+            },
+        }
+    }
+
+    fn folder_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| self.name.clone())
+    }
+
+    fn parent_folder_name(&self) -> Option<String> {
+        self.path
+            .parent()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().to_string())
+            .filter(|name| !name.is_empty())
+    }
+
+    fn remote_repo_name(&self) -> Option<&str> {
+        self.status
             .as_ref()
             .and_then(|status| status.github_url.as_deref())
-            .and_then(github_repo_name_from_url);
+            .and_then(github_repo_name_from_url)
+    }
+}
 
-        match repo_name {
-            Some(repo_name) => format!("{folder}:{repo_name}"),
-            None => folder.to_string(),
+impl RepoList {
+    fn has_duplicate_folder_name(&self, repo_idx: usize) -> bool {
+        let folder = self
+            .repos
+            .get(repo_idx)
+            .and_then(|entry| entry.path.file_name())
+            .map(|name| name.to_string_lossy());
+        let Some(folder) = folder else {
+            return false;
+        };
+
+        self.repos.iter().enumerate().any(|(idx, other)| {
+            idx != repo_idx
+                && other
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy() == folder)
+        })
+    }
+
+    pub(crate) fn display_name_for_index(&self, repo_idx: usize) -> Option<String> {
+        let entry = self.repos.get(repo_idx)?;
+        if self.has_duplicate_folder_name(repo_idx) && entry.remote_repo_name().is_none() {
+            Some(entry.display_name_with_parent_fallback())
+        } else {
+            Some(entry.display_name())
         }
     }
 }
@@ -248,7 +300,7 @@ impl RepoList {
         }
     }
 
-    fn render_repo_item(&self, entry: &RepoEntry, _repo_idx: usize) -> ListItem<'static> {
+    fn render_repo_item(&self, entry: &RepoEntry, repo_idx: usize) -> ListItem<'static> {
         let mut spans = Vec::new();
 
         // Dirty / git-op indicator
@@ -318,7 +370,9 @@ impl RepoList {
         }
 
         // Repo name
-        let repo_label = entry.display_name();
+        let repo_label = self
+            .display_name_for_index(repo_idx)
+            .unwrap_or_else(|| entry.display_name());
         spans.push(Span::styled(repo_label, Style::default().fg(Color::White)));
 
         ListItem::new(Line::from(spans))
