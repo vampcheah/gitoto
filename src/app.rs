@@ -1078,8 +1078,9 @@ impl App {
                                 continue;
                             }
                             entry.git_op = true;
+                            let push_target = entry.display_name();
                             self.success_message =
-                                Some((format!("Pushing {}...", entry.name), Instant::now()));
+                                Some((format!("Pushing to {push_target}..."), Instant::now()));
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             self.spawn_git_operation(

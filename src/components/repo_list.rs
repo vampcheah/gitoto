@@ -25,6 +25,27 @@ pub(crate) struct RepoEntry {
     pub git_op: bool,
 }
 
+impl RepoEntry {
+    pub(crate) fn display_name(&self) -> String {
+        let folder = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| self.name.clone().into());
+
+        let repo_name = self
+            .status
+            .as_ref()
+            .and_then(|status| status.github_url.as_deref())
+            .and_then(github_repo_name_from_url);
+
+        match repo_name {
+            Some(repo_name) => format!("{folder}:{repo_name}"),
+            None => folder.to_string(),
+        }
+    }
+}
+
 /// Maps a visual row in the list to either a repo or one of its worktrees.
 #[derive(Clone, Debug)]
 enum DisplayRow {
@@ -297,10 +318,8 @@ impl RepoList {
         }
 
         // Repo name
-        spans.push(Span::styled(
-            entry.name.clone(),
-            Style::default().fg(Color::White),
-        ));
+        let repo_label = entry.display_name();
+        spans.push(Span::styled(repo_label, Style::default().fg(Color::White)));
 
         ListItem::new(Line::from(spans))
     }
@@ -313,6 +332,13 @@ impl RepoList {
         ];
         ListItem::new(Line::from(spans))
     }
+}
+
+fn github_repo_name_from_url(url: &str) -> Option<&str> {
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 impl Component for RepoList {
