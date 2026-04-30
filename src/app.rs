@@ -868,20 +868,27 @@ impl App {
                     }
                     Action::ShowContextMenu { ref id, row, col } => {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let (ahead, behind, has_upstream, has_submodules, has_github_remote) =
-                                self.repo_list.repos[idx]
-                                    .status
-                                    .as_ref()
-                                    .map(|s| {
-                                        (
-                                            s.ahead,
-                                            s.behind,
-                                            s.has_upstream,
-                                            s.has_submodules,
-                                            s.has_github_remote,
-                                        )
-                                    })
-                                    .unwrap_or((0, 0, false, false, false));
+                            let (
+                                ahead,
+                                behind,
+                                has_upstream,
+                                has_submodules,
+                                has_github_remote,
+                                has_origin_remote,
+                            ) = self.repo_list.repos[idx]
+                                .status
+                                .as_ref()
+                                .map(|s| {
+                                    (
+                                        s.ahead,
+                                        s.behind,
+                                        s.has_upstream,
+                                        s.has_submodules,
+                                        s.has_github_remote,
+                                        s.has_origin_remote,
+                                    )
+                                })
+                                .unwrap_or((0, 0, false, false, false, false));
                             self.context_menu.show(
                                 id.clone(),
                                 col,
@@ -892,6 +899,7 @@ impl App {
                                     has_upstream,
                                     has_submodules,
                                     has_github_remote,
+                                    has_origin_remote,
                                 },
                             );
                         }
@@ -1086,9 +1094,19 @@ impl App {
                             );
                         }
                     }
+                    Action::RemoveOriginRemote(ref id) => {
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let name = self.repo_list.repos[idx].name.clone();
+                            self.confirm_dialog.show(
+                                format!("Remove origin remote from {name}?"),
+                                Action::RunRemoveOriginRemote(id.clone()),
+                            );
+                        }
+                    }
                     Action::GitPull(ref id)
                     | Action::RunGitPullRebase(ref id)
-                    | Action::RunGitPullSubmodules(ref id) => {
+                    | Action::RunGitPullSubmodules(ref id)
+                    | Action::RunRemoveOriginRemote(ref id) => {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &mut self.repo_list.repos[idx];
                             let branch = entry
@@ -1096,16 +1114,24 @@ impl App {
                                 .as_ref()
                                 .map(|s| s.branch.clone())
                                 .unwrap_or_default();
+                            let should_add_origin_branch =
+                                !matches!(&action, Action::RunRemoveOriginRemote(_));
                             let mut git_args = match action {
                                 Action::GitPull(_) => git_args(&["pull"]),
                                 Action::RunGitPullRebase(_) => git_args(&["pull", "--rebase"]),
                                 Action::RunGitPullSubmodules(_) => {
                                     git_args(&["pull", "--recurse-submodules"])
                                 }
+                                Action::RunRemoveOriginRemote(_) => {
+                                    git_args(&["remote", "remove", "origin"])
+                                }
                                 _ => unreachable!(),
                             };
                             // Add origin <branch> so pull/push works even without upstream config
-                            if !branch.is_empty() && branch != "(no branch)" {
+                            if should_add_origin_branch
+                                && !branch.is_empty()
+                                && branch != "(no branch)"
+                            {
                                 git_args.push("origin".into());
                                 git_args.push(branch);
                             }

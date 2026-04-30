@@ -21,6 +21,8 @@ pub(crate) struct RepoStatus {
     pub fetch_failed: bool,
     /// True when any configured remote points at github.com.
     pub has_github_remote: bool,
+    /// True when the repo has an `origin` remote.
+    pub has_origin_remote: bool,
     /// Lightweight snapshot of HEAD/refs/worktree heads used to avoid graph reloads.
     pub graph_key: String,
     /// Snapshot of remote refs used to refresh pushed markers without rebuilding graph rows.
@@ -145,6 +147,7 @@ fn query_status_inner(
     let has_upstream = has_upstream(&repo);
     let (ahead, behind) = compute_ahead_behind(&repo);
     let has_github_remote = has_github_remote(&repo);
+    let has_origin_remote = has_origin_remote(&repo);
 
     // File statuses
     let mut opts = StatusOptions::new();
@@ -277,6 +280,7 @@ fn query_status_inner(
         has_dirty_submodules,
         fetch_failed,
         has_github_remote,
+        has_origin_remote,
         graph_key,
         remote_key,
     };
@@ -400,6 +404,10 @@ fn has_github_remote(repo: &Repository) -> bool {
             remote.url().is_some_and(is_github_url) || remote.pushurl().is_some_and(is_github_url)
         })
     })
+}
+
+fn has_origin_remote(repo: &Repository) -> bool {
+    repo.find_remote("origin").is_ok()
 }
 
 fn is_github_url(url: &str) -> bool {
@@ -541,6 +549,7 @@ mod tests {
         assert!(!status.is_dirty);
         assert!(status.files.is_empty());
         assert!(!status.has_github_remote);
+        assert!(!status.has_origin_remote);
     }
 
     #[test]
@@ -552,6 +561,7 @@ mod tests {
         let status = query_status(tmp.path(), false).unwrap();
 
         assert!(status.has_github_remote);
+        assert!(status.has_origin_remote);
     }
 
     #[test]

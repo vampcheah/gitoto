@@ -81,6 +81,8 @@ pub(crate) enum Action {
     RunGitPullRebase(RepoId),
     GitPullSubmodules(RepoId),
     RunGitPullSubmodules(RepoId),
+    RemoveOriginRemote(RepoId),
+    RunRemoveOriginRemote(RepoId),
     GitSubmoduleUpdate(RepoId),
     GitSubmoduleSync(RepoId),
     GitSubmoduleUpdateLatest(RepoId),

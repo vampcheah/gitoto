@@ -26,6 +26,7 @@ enum MenuAction {
     Pull,
     PullRebase,
     PullSubmodules,
+    RemoveOriginRemote,
     SubmoduleUpdate,
     SubmoduleSync,
     SubmoduleUpdateLatest,
@@ -42,6 +43,7 @@ pub(crate) struct RepoMenuState {
     pub has_upstream: bool,
     pub has_submodules: bool,
     pub has_github_remote: bool,
+    pub has_origin_remote: bool,
 }
 
 pub(crate) struct ContextMenu {
@@ -113,6 +115,13 @@ impl ContextMenu {
             self.items.push(MenuItem {
                 label: "Create GitHub repo (public)".into(),
                 action: MenuAction::CreateGithubPublic,
+            });
+        }
+
+        if repo_state.has_origin_remote {
+            self.items.push(MenuItem {
+                label: "Remove origin remote".into(),
+                action: MenuAction::RemoveOriginRemote,
             });
         }
 
@@ -214,6 +223,7 @@ impl ContextMenu {
             MenuAction::Pull => Action::GitPull(id),
             MenuAction::PullRebase => Action::GitPullRebase(id),
             MenuAction::PullSubmodules => Action::GitPullSubmodules(id),
+            MenuAction::RemoveOriginRemote => Action::RemoveOriginRemote(id),
             MenuAction::SubmoduleUpdate => Action::GitSubmoduleUpdate(id),
             MenuAction::SubmoduleSync => Action::GitSubmoduleSync(id),
             MenuAction::SubmoduleUpdateLatest => Action::GitSubmoduleUpdateLatest(id),
@@ -314,6 +324,7 @@ impl Component for ContextMenu {
                     MenuAction::Pull | MenuAction::PullRebase | MenuAction::PullSubmodules => {
                         Style::default().fg(Color::Yellow)
                     }
+                    MenuAction::RemoveOriginRemote => Style::default().fg(Color::Red),
                     MenuAction::SubmoduleUpdate
                     | MenuAction::SubmoduleSync
                     | MenuAction::SubmoduleUpdateLatest => Style::default().fg(Color::LightMagenta),
