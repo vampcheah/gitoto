@@ -53,13 +53,13 @@ gh auth login
 gh auth setup-git
 ```
 
-Run it with the default scan root:
+Run it from the folder you want to scan:
 
 ```bash
 gitoto
 ```
 
-Or scan a specific directory:
+Or scan a specific directory from anywhere:
 
 ```bash
 gitoto --root ~/projects

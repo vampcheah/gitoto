@@ -16,7 +16,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "gitoto", about = "Multi-repo Git source control panel")]
 struct Cli {
-    /// Root directory to scan for repos
+    /// Root directory to scan for repos (defaults to the current directory)
     #[arg(long)]
     root: Option<PathBuf>,
 
@@ -57,9 +57,11 @@ async fn main() -> Result<()> {
 
     let mut config = config::Config::load()?;
 
-    if let Some(root) = cli.root {
-        config.override_root(root);
-    }
+    let root = match cli.root {
+        Some(root) => root,
+        None => std::env::current_dir()?,
+    };
+    config.override_root(root);
     if cli.fast {
         config.performance.fast_mode = true;
     }
