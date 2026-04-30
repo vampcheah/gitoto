@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::config::RepoNameFormat;
 use crate::git::status::RepoStatus;
 use crate::repo_id::RepoId;
 
@@ -27,22 +28,31 @@ pub(crate) struct RepoEntry {
 
 impl RepoEntry {
     pub(crate) fn display_name(&self) -> String {
+        self.display_name_for_format(RepoNameFormat::FolderGithub, false)
+    }
+
+    pub(crate) fn display_name_for_format(
+        &self,
+        format: RepoNameFormat,
+        duplicate_fallback: bool,
+    ) -> String {
         let folder = self.folder_name();
-        match self.remote_repo_name() {
-            Some(repo_name) => format!("{folder}:{repo_name}"),
-            None => folder,
+        match format {
+            RepoNameFormat::FolderGithub => match self.remote_repo_name() {
+                Some(repo_name) => format!("{folder}:{repo_name}"),
+                None if duplicate_fallback => self.parent_folder_label(folder),
+                None => folder,
+            },
+            RepoNameFormat::Folder => folder,
+            RepoNameFormat::ParentFolder => self.parent_folder_label(folder),
+            RepoNameFormat::Path => self.path.to_string_lossy().to_string(),
         }
     }
 
-    fn display_name_with_parent_fallback(&self) -> String {
-        let folder = self.folder_name();
-        match self.remote_repo_name() {
-            Some(repo_name) => format!("{folder}:{repo_name}"),
-            None => match self.parent_folder_name() {
-                Some(parent) => format!("{parent}:{folder}"),
-                None => folder,
-            },
-        }
+    fn parent_folder_label(&self, folder: String) -> String {
+        self.parent_folder_name()
+            .map(|parent| format!("{parent}:{folder}"))
+            .unwrap_or(folder)
     }
 
     fn folder_name(&self) -> String {
@@ -68,36 +78,6 @@ impl RepoEntry {
     }
 }
 
-impl RepoList {
-    fn has_duplicate_folder_name(&self, repo_idx: usize) -> bool {
-        let folder = self
-            .repos
-            .get(repo_idx)
-            .and_then(|entry| entry.path.file_name())
-            .map(|name| name.to_string_lossy());
-        let Some(folder) = folder else {
-            return false;
-        };
-
-        self.repos.iter().enumerate().any(|(idx, other)| {
-            idx != repo_idx
-                && other
-                    .path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy() == folder)
-        })
-    }
-
-    pub(crate) fn display_name_for_index(&self, repo_idx: usize) -> Option<String> {
-        let entry = self.repos.get(repo_idx)?;
-        if self.has_duplicate_folder_name(repo_idx) && entry.remote_repo_name().is_none() {
-            Some(entry.display_name_with_parent_fallback())
-        } else {
-            Some(entry.display_name())
-        }
-    }
-}
-
 /// Maps a visual row in the list to either a repo or one of its worktrees.
 #[derive(Clone, Debug)]
 enum DisplayRow {
@@ -115,10 +95,17 @@ pub(crate) struct RepoList {
     expanded_repos: HashSet<RepoId>,
     /// Computed mapping from visual row → data
     display_rows: Vec<DisplayRow>,
+    display_rows_dirty: bool,
+    duplicate_folder_names: HashSet<String>,
+    repo_name_format: RepoNameFormat,
 }
 
 impl RepoList {
-    pub fn new(repo_paths: Vec<PathBuf>, _ignore_dirty_subs: bool) -> Self {
+    pub fn new(
+        repo_paths: Vec<PathBuf>,
+        _ignore_dirty_subs: bool,
+        repo_name_format: RepoNameFormat,
+    ) -> Self {
         let repos: Vec<RepoEntry> = repo_paths
             .into_iter()
             .map(|path| {
@@ -148,12 +135,38 @@ impl RepoList {
             action_tx: None,
             expanded_repos: HashSet::new(),
             display_rows: Vec::new(),
+            display_rows_dirty: true,
+            duplicate_folder_names: HashSet::new(),
+            repo_name_format,
         };
-        list.rebuild_display_rows();
+        list.rebuild_structure_cache();
         list
     }
 
-    /// Recompute display_rows from repos + expansion state.
+    fn mark_structure_dirty(&mut self) {
+        self.display_rows_dirty = true;
+    }
+
+    fn folder_name_for_entry(entry: &RepoEntry) -> Option<String> {
+        entry
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+    }
+
+    fn rebuild_duplicate_folder_names(&mut self) {
+        let mut seen = HashSet::new();
+        let mut duplicates = HashSet::new();
+        for entry in &self.repos {
+            if let Some(folder) = Self::folder_name_for_entry(entry)
+                && !seen.insert(folder.clone())
+            {
+                duplicates.insert(folder);
+            }
+        }
+        self.duplicate_folder_names = duplicates;
+    }
+
     fn rebuild_display_rows(&mut self) {
         self.display_rows.clear();
         for (i, entry) in self.repos.iter().enumerate() {
@@ -167,6 +180,64 @@ impl RepoList {
                 }
             }
         }
+        self.display_rows_dirty = false;
+    }
+
+    fn rebuild_structure_cache(&mut self) {
+        self.rebuild_duplicate_folder_names();
+        self.rebuild_display_rows();
+    }
+
+    fn ensure_display_rows(&mut self) {
+        if self.display_rows_dirty {
+            self.rebuild_display_rows();
+        }
+    }
+
+    fn has_duplicate_folder_name(&self, repo_idx: usize) -> bool {
+        self.repos
+            .get(repo_idx)
+            .and_then(Self::folder_name_for_entry)
+            .is_some_and(|folder| self.duplicate_folder_names.contains(&folder))
+    }
+
+    pub(crate) fn display_name_for_index(&self, repo_idx: usize) -> Option<String> {
+        let entry = self.repos.get(repo_idx)?;
+        Some(entry.display_name_for_format(
+            self.repo_name_format,
+            self.has_duplicate_folder_name(repo_idx),
+        ))
+    }
+
+    pub(crate) fn push_repo(&mut self, entry: RepoEntry) {
+        self.repos.push(entry);
+        self.rebuild_structure_cache();
+    }
+
+    pub(crate) fn remove_repo(&mut self, index: usize) -> Option<RepoEntry> {
+        if index >= self.repos.len() {
+            return None;
+        }
+        let entry = self.repos.remove(index);
+        self.expanded_repos.retain(|id| id.0 != entry.path);
+        self.rebuild_structure_cache();
+        Some(entry)
+    }
+
+    pub(crate) fn sort_alphabetical(&mut self) {
+        self.repos.sort_by_key(|r| r.name.to_lowercase());
+        self.rebuild_structure_cache();
+    }
+
+    pub(crate) fn sort_dirty_first(&mut self) {
+        self.repos.sort_by(|a, b| {
+            let a_dirty = a.status.as_ref().map(|s| s.is_dirty).unwrap_or(false);
+            let b_dirty = b.status.as_ref().map(|s| s.is_dirty).unwrap_or(false);
+            b_dirty
+                .cmp(&a_dirty)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+        self.rebuild_structure_cache();
     }
 
     /// Returns the parent repo index for the current selection.
@@ -292,7 +363,8 @@ impl RepoList {
         if self.expanded_repos.contains(&id) {
             // Collapsing: move selection to the parent repo row
             self.expanded_repos.remove(&id);
-            self.rebuild_display_rows();
+            self.mark_structure_dirty();
+            self.ensure_display_rows();
             self.select_repo_row(repo_idx);
         } else {
             self.expanded_repos.insert(id);
@@ -509,8 +581,7 @@ impl Component for RepoList {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         self.render_area = area;
-        // Ensure display_rows is fresh
-        self.rebuild_display_rows();
+        self.ensure_display_rows();
 
         let items: Vec<ListItem> = self
             .display_rows
@@ -542,5 +613,99 @@ impl Component for RepoList {
 
         frame.render_stateful_widget(list, area, &mut self.state);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::status::RepoStatus;
+
+    fn entry(path: &str, github_url: Option<&str>) -> RepoEntry {
+        RepoEntry {
+            path: PathBuf::from(path),
+            name: PathBuf::from(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string(),
+            status: github_url.map(|url| RepoStatus {
+                branch: "main".to_string(),
+                files: Vec::new(),
+                ahead: 0,
+                behind: 0,
+                has_upstream: false,
+                is_dirty: false,
+                worktree_info: Vec::new(),
+                has_submodules: false,
+                submodules: Vec::new(),
+                has_dirty_submodules: false,
+                fetch_failed: false,
+                has_github_remote: true,
+                github_url: Some(url.to_string()),
+                has_origin_remote: true,
+                graph_key: String::new(),
+                remote_key: String::new(),
+            }),
+            git_op: false,
+        }
+    }
+
+    #[test]
+    fn display_name_uses_folder_and_github_repo() {
+        let entry = entry("/home/me/015_gitoto", Some("https://github.com/me/gitoto"));
+        assert_eq!(entry.display_name(), "015_gitoto:gitoto");
+    }
+
+    #[test]
+    fn display_name_folder_github_falls_back_to_folder() {
+        let entry = entry("/home/me/015_gitoto", None);
+        assert_eq!(
+            entry.display_name_for_format(RepoNameFormat::FolderGithub, false),
+            "015_gitoto"
+        );
+    }
+
+    #[test]
+    fn display_name_parent_folder_format() {
+        let entry = entry("/home/me/projects/015_gitoto", None);
+        assert_eq!(
+            entry.display_name_for_format(RepoNameFormat::ParentFolder, false),
+            "projects:015_gitoto"
+        );
+    }
+
+    #[test]
+    fn display_name_duplicate_folder_uses_parent_fallback() {
+        let list = RepoList::new(
+            vec![
+                PathBuf::from("/home/me/work/app"),
+                PathBuf::from("/home/me/archive/app"),
+            ],
+            false,
+            RepoNameFormat::FolderGithub,
+        );
+
+        assert_eq!(list.display_name_for_index(0).as_deref(), Some("work:app"));
+        assert_eq!(
+            list.display_name_for_index(1).as_deref(),
+            Some("archive:app")
+        );
+    }
+
+    #[test]
+    fn display_name_duplicate_cache_updates_after_remove() {
+        let mut list = RepoList::new(
+            vec![
+                PathBuf::from("/home/me/work/app"),
+                PathBuf::from("/home/me/archive/app"),
+            ],
+            false,
+            RepoNameFormat::FolderGithub,
+        );
+
+        list.remove_repo(1);
+
+        assert_eq!(list.display_name_for_index(0).as_deref(), Some("app"));
     }
 }

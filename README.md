@@ -199,6 +199,13 @@ watch_exclude_dirs = ["node_modules", "target", ".build", "dist", "vendor"]
 frame_rate = 10
 check_for_updates = false
 update_position = "top-right"
+# "folder-github" shows local-folder:github-repo when a GitHub remote exists.
+# Other values: "folder", "parent-folder", "path".
+repo_name_format = "folder-github"
+
+[github]
+# Add GitHub Enterprise hosts here so GitHub actions and URLs work for them.
+hosts = ["github.com"]
 
 [graph]
 branches = "all"

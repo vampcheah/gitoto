@@ -16,7 +16,6 @@ use crate::components::git_graph::GitGraph;
 use crate::components::github_repo_input::GitHubRepoInput;
 use crate::components::notice_dialog::NoticeDialog;
 use crate::components::path_input::PathInput;
-use crate::components::repo_list::RepoEntry;
 use crate::components::repo_list::RepoList;
 use crate::components::status_bar::StatusBar;
 use crate::config::Config;
@@ -28,14 +27,16 @@ use crate::repo_id::RepoId;
 use crate::tui::Tui;
 use crate::watcher::RepoWatcher;
 
+mod actions;
 mod git_ops;
 mod helpers;
 mod input;
 mod perf;
+mod repo_actions;
 mod ui;
 
 use helpers::{
-    ActiveWorktree, StatusFailure, StatusGuard, StatusQuery, base64_encode, git_args,
+    ActiveWorktree, StatusFailure, StatusGuard, StatusQuery, base64_encode,
     is_valid_github_repo_name, open_browser_url,
 };
 
@@ -135,6 +136,7 @@ impl App {
         };
 
         let update_position = config.ui.update_position;
+        let repo_name_format = config.ui.repo_name_format;
         let ignore_dirty_subs = config.submodules.ignore_dirty;
         let poll_semaphore = Arc::new(tokio::sync::Semaphore::new(
             config.watch.max_concurrent_polls,
@@ -143,7 +145,7 @@ impl App {
         Self {
             config,
             should_quit: false,
-            repo_list: RepoList::new(repo_paths, ignore_dirty_subs),
+            repo_list: RepoList::new(repo_paths, ignore_dirty_subs, repo_name_format),
             file_list: FileList::new(),
             git_graph,
             confirm_dialog: ConfirmDialog::new(),
@@ -184,18 +186,8 @@ impl App {
 
     fn sort_repos(&mut self) {
         match self.sort_order {
-            SortOrder::Alphabetical => {
-                self.repo_list.repos.sort_by_key(|r| r.name.to_lowercase());
-            }
-            SortOrder::DirtyFirst => {
-                self.repo_list.repos.sort_by(|a, b| {
-                    let a_dirty = a.status.as_ref().map(|s| s.is_dirty).unwrap_or(false);
-                    let b_dirty = b.status.as_ref().map(|s| s.is_dirty).unwrap_or(false);
-                    b_dirty
-                        .cmp(&a_dirty)
-                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                });
-            }
+            SortOrder::Alphabetical => self.repo_list.sort_alphabetical(),
+            SortOrder::DirtyFirst => self.repo_list.sort_dirty_first(),
         }
         // Reset selection to first
         if !self.repo_list.repos.is_empty() {
@@ -208,7 +200,7 @@ impl App {
         if let Some(idx) = self.repo_list.selected_index()
             && let Some(entry) = self.repo_list.repos.get(idx)
         {
-            let name = entry.name.clone();
+            let name = self.repo_display_name(idx);
             let repo_id = RepoId(entry.path.clone());
             let files = entry
                 .status
@@ -234,7 +226,7 @@ impl App {
         if let Some(idx) = self.repo_list.resolve_index(id) {
             self.repo_list.select_repo_row(idx);
             let entry = &self.repo_list.repos[idx];
-            let name = entry.name.clone();
+            let name = self.repo_display_name(idx);
             let path = entry.path.clone();
             let files = entry
                 .status
@@ -266,7 +258,13 @@ impl App {
         self.focused_repo
             .as_ref()
             .and_then(|id| self.repo_list.resolve_index(id))
-            .map(|idx| self.repo_list.repos[idx].name.clone())
+            .map(|idx| self.repo_display_name(idx))
+    }
+
+    pub(super) fn repo_display_name(&self, idx: usize) -> String {
+        self.repo_list
+            .display_name_for_index(idx)
+            .unwrap_or_else(|| self.repo_list.repos[idx].name.clone())
     }
 
     fn add_operation_log(&mut self, message: impl Into<String>) {
@@ -287,22 +285,27 @@ impl App {
         let sem = self.poll_semaphore.clone();
         let ignore_dirty_subs = self.config.submodules.ignore_dirty;
         let untracked = self.effective_untracked_mode();
+        let github_hosts = self.config.github.hosts.clone();
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             let guard = StatusGuard::new(repo_id.clone(), tx.clone());
             tokio::task::spawn_blocking(move || {
                 let result = match query {
-                    StatusQuery::Local => crate::git::status::query_status_with_untracked(
-                        &path,
-                        ignore_dirty_subs,
-                        untracked,
-                    ),
-                    StatusQuery::Fetch => {
-                        crate::git::status::query_status_with_fetch_and_untracked(
+                    StatusQuery::Local => {
+                        crate::git::status::query_status_with_untracked_and_github_hosts(
                             &path,
                             ignore_dirty_subs,
                             untracked,
+                            &github_hosts,
+                        )
+                    }
+                    StatusQuery::Fetch => {
+                        crate::git::status::query_status_with_fetch_untracked_and_github_hosts(
+                            &path,
+                            ignore_dirty_subs,
+                            untracked,
+                            &github_hosts,
                         )
                     }
                 };
@@ -338,14 +341,16 @@ impl App {
         let sem = self.poll_semaphore.clone();
         let ignore_dirty_subs = self.config.submodules.ignore_dirty;
         let untracked = self.effective_untracked_mode();
+        let github_hosts = self.config.github.hosts.clone();
 
         tokio::spawn(async move {
             let _permit = sem.acquire().await;
             tokio::task::spawn_blocking(move || {
-                match crate::git::status::query_status_with_untracked(
+                match crate::git::status::query_status_with_untracked_and_github_hosts(
                     &worktree.path,
                     ignore_dirty_subs,
                     untracked,
+                    &github_hosts,
                 ) {
                     Ok(status) => {
                         let _ = tx.send(Action::WorktreeFilesLoaded {
@@ -469,6 +474,18 @@ impl App {
             // Process actions
             while let Ok(action) = self.action_rx.try_recv() {
                 let render_after = !matches!(&action, Action::Tick | Action::Render);
+                if self.handle_git_action(&action)? {
+                    if render_after {
+                        render_requested = true;
+                    }
+                    continue;
+                }
+                if self.handle_repo_action(&action)? {
+                    if render_after {
+                        render_requested = true;
+                    }
+                    continue;
+                }
                 match action {
                     Action::Tick => {
                         if self.expire_messages() {
@@ -493,7 +510,7 @@ impl App {
                         self.active_worktree = None;
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &self.repo_list.repos[idx];
-                            let name = entry.name.clone();
+                            let name = self.repo_display_name(idx);
                             let path = entry.path.clone();
                             let repo_id = id.clone();
                             let files = entry
@@ -520,7 +537,7 @@ impl App {
                         let repo_name = self
                             .repo_list
                             .resolve_index(repo_id)
-                            .map(|i| self.repo_list.repos[i].name.clone())
+                            .map(|i| self.repo_display_name(i))
                             .unwrap_or_default();
                         let display_name = format!("{}:{}", repo_name, worktree_branch);
 
@@ -598,7 +615,7 @@ impl App {
                             let selected_repo = self.repo_list.selected_index() == Some(idx)
                                 && self.active_worktree.is_none();
                             let selected_files = selected_repo.then(|| status.files.clone());
-                            let selected_name = self.repo_list.repos[idx].name.clone();
+                            let selected_name = self.repo_display_name(idx);
                             self.repo_list.update_status(idx, status);
 
                             // Refresh the file list so stale diffs are cleared
@@ -834,8 +851,8 @@ impl App {
                     Action::StartCommit(ref id) => {
                         self.context_menu.hide();
                         if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &self.repo_list.repos[idx];
-                            self.commit_input.show(id.clone(), entry.name.clone());
+                            self.commit_input
+                                .show(id.clone(), self.repo_display_name(idx));
                         }
                     }
                     Action::UpdateCommitMessage(ref _message) => {}
@@ -893,7 +910,7 @@ impl App {
                             let entry = &mut self.repo_list.repos[idx];
                             entry.git_op = true;
                             let path = entry.path.clone();
-                            let repo_name = entry.name.clone();
+                            let repo_name = self.repo_display_name(idx);
                             let no_verify = self.config.commit.no_verify;
                             self.commit_input.hide();
                             self.spawn_git_operation(
@@ -901,236 +918,6 @@ impl App {
                                 move || crate::git::commit_all(&path, &message, no_verify),
                                 move |_| format!("Committed {}", repo_name),
                                 Some("Commit failed"),
-                            );
-                        }
-                    }
-                    Action::GitPush(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            let (branch, has_upstream, ahead) = entry
-                                .status
-                                .as_ref()
-                                .map(|s| (s.branch.clone(), s.has_upstream, s.ahead))
-                                .unwrap_or_default();
-                            if branch.is_empty() || branch == "(no branch)" || branch == "HEAD" {
-                                self.error_message =
-                                    Some(("Cannot push detached HEAD".to_string(), Instant::now()));
-                                continue;
-                            }
-                            if !has_upstream {
-                                self.error_message = Some((
-                                    format!(
-                                        "Branch '{branch}' has no upstream; press P to publish"
-                                    ),
-                                    Instant::now(),
-                                ));
-                                continue;
-                            }
-                            if ahead == 0 {
-                                self.success_message =
-                                    Some(("Nothing to push".to_string(), Instant::now()));
-                                continue;
-                            }
-                            entry.git_op = true;
-                            let push_target = entry.display_name();
-                            self.success_message =
-                                Some((format!("Pushing to {push_target}..."), Instant::now()));
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::push(&path),
-                                |_| "git push succeeded".to_string(),
-                                None,
-                            );
-                        }
-                    }
-                    Action::GitPublish(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            let branch = entry
-                                .status
-                                .as_ref()
-                                .map(|s| s.branch.clone())
-                                .unwrap_or_default();
-                            entry.git_op = true;
-                            let publish_target = entry.display_name();
-                            self.success_message =
-                                Some((format!("Publishing {publish_target}..."), Instant::now()));
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            let success_branch = branch.clone();
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::publish(&path, &branch),
-                                move |_| format!("Published {success_branch}"),
-                                Some("Publish failed"),
-                            );
-                        }
-                    }
-                    Action::CreateGitHubRepo {
-                        ref id,
-                        private,
-                        ref name,
-                    } => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            entry.git_op = true;
-                            let visibility = if private { "private" } else { "public" };
-                            self.success_message = Some((
-                                format!("Creating {visibility} GitHub repo {name}..."),
-                                Instant::now(),
-                            ));
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            let repo_name = name.clone();
-                            let success_name = name.clone();
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::create_github_repo(&path, &repo_name, private),
-                                move |_| format!("Created {visibility} GitHub repo {success_name}"),
-                                Some("Create GitHub repo failed"),
-                            );
-                        }
-                    }
-                    Action::GitPullRebase(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let name = self.repo_list.repos[idx].name.clone();
-                            self.confirm_dialog.show(
-                                format!("Pull --rebase {name}?"),
-                                Action::RunGitPullRebase(id.clone()),
-                            );
-                        }
-                    }
-                    Action::GitPullSubmodules(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let name = self.repo_list.repos[idx].name.clone();
-                            self.confirm_dialog.show(
-                                format!("Pull submodules for {name}?"),
-                                Action::RunGitPullSubmodules(id.clone()),
-                            );
-                        }
-                    }
-                    Action::RemoveOriginRemote(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let name = self.repo_list.repos[idx].name.clone();
-                            self.confirm_dialog.show(
-                                format!("Remove origin remote from {name}?"),
-                                Action::RunRemoveOriginRemote(id.clone()),
-                            );
-                        }
-                    }
-                    Action::GitPull(ref id)
-                    | Action::RunGitPullRebase(ref id)
-                    | Action::RunGitPullSubmodules(ref id)
-                    | Action::RunRemoveOriginRemote(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            let branch = entry
-                                .status
-                                .as_ref()
-                                .map(|s| s.branch.clone())
-                                .unwrap_or_default();
-                            let should_add_origin_branch =
-                                !matches!(&action, Action::RunRemoveOriginRemote(_));
-                            let mut git_args = match action {
-                                Action::GitPull(_) => git_args(&["pull"]),
-                                Action::RunGitPullRebase(_) => git_args(&["pull", "--rebase"]),
-                                Action::RunGitPullSubmodules(_) => {
-                                    git_args(&["pull", "--recurse-submodules"])
-                                }
-                                Action::RunRemoveOriginRemote(_) => {
-                                    git_args(&["remote", "remove", "origin"])
-                                }
-                                _ => unreachable!(),
-                            };
-                            // Add origin <branch> so pull/push works even without upstream config
-                            if should_add_origin_branch
-                                && !branch.is_empty()
-                                && branch != "(no branch)"
-                            {
-                                git_args.push("origin".into());
-                                git_args.push(branch);
-                            }
-                            entry.git_op = true;
-                            let display_name = entry.display_name();
-                            let progress = match action {
-                                Action::GitPull(_) => format!("Pulling {display_name}..."),
-                                Action::RunGitPullRebase(_) => {
-                                    format!("Rebasing {display_name}...")
-                                }
-                                Action::RunGitPullSubmodules(_) => {
-                                    format!("Pulling submodules for {display_name}...")
-                                }
-                                Action::RunRemoveOriginRemote(_) => {
-                                    format!("Removing origin from {display_name}...")
-                                }
-                                _ => unreachable!(),
-                            };
-                            self.success_message = Some((progress, Instant::now()));
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            let success = format!("git {} succeeded", git_args.join(" "));
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::run_git_args(&path, &git_args),
-                                move |_| success,
-                                None,
-                            );
-                        }
-                    }
-                    Action::GitSubmoduleUpdateLatest(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let name = self.repo_list.repos[idx].name.clone();
-                            self.confirm_dialog.show(
-                                format!("Pull latest in all submodules for {name}?"),
-                                Action::RunGitSubmoduleUpdateLatest(id.clone()),
-                            );
-                        }
-                    }
-                    Action::GitSubmoduleUpdate(ref id)
-                    | Action::GitSubmoduleSync(ref id)
-                    | Action::RunGitSubmoduleUpdateLatest(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            let git_args = match action {
-                                Action::GitSubmoduleUpdate(_) => {
-                                    git_args(&["submodule", "update", "--init", "--recursive"])
-                                }
-                                Action::GitSubmoduleSync(_) => git_args(&["submodule", "sync"]),
-                                Action::RunGitSubmoduleUpdateLatest(_) => git_args(&[
-                                    "submodule",
-                                    "foreach",
-                                    "git",
-                                    "pull",
-                                    "origin",
-                                    "HEAD",
-                                ]),
-                                _ => unreachable!(),
-                            };
-                            entry.git_op = true;
-                            let display_name = entry.display_name();
-                            let progress = match action {
-                                Action::GitSubmoduleUpdate(_) => {
-                                    format!("Updating submodules for {display_name}...")
-                                }
-                                Action::GitSubmoduleSync(_) => {
-                                    format!("Syncing submodules for {display_name}...")
-                                }
-                                Action::RunGitSubmoduleUpdateLatest(_) => {
-                                    format!("Pulling latest in submodules for {display_name}...")
-                                }
-                                _ => unreachable!(),
-                            };
-                            self.success_message = Some((progress, Instant::now()));
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            let success = format!("git {} succeeded", git_args.join(" "));
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::run_git_args(&path, &git_args),
-                                move |_| success,
-                                None,
                             );
                         }
                     }
@@ -1416,107 +1203,6 @@ impl App {
                         if generation == self.git_graph.current_detail_generation() {
                             self.git_graph.set_commit_diff(content);
                         }
-                    }
-                    Action::OpenAddRepo => {
-                        self.path_input.show();
-                    }
-                    Action::AddRepo(ref path) => {
-                        self.path_input.hide();
-                        let path = path.clone();
-                        if !path.join(".git").exists() && !path.join("HEAD").exists() {
-                            let input = path.to_string_lossy();
-                            let message = if input.starts_with("http://")
-                                || input.starts_with("https://")
-                                || input.starts_with("git@")
-                            {
-                                format!(
-                                    "Remote repository URLs are not added directly yet: {input}. Clone the repo locally first, then add the local path."
-                                )
-                            } else {
-                                format!("Not a git repository: {}", path.display())
-                            };
-                            self.action_tx.send(Action::Notice(message))?;
-                        } else {
-                            let name = path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().to_string())
-                                .unwrap_or_else(|| path.to_string_lossy().to_string());
-                            self.config.add_pinned_repo(path.clone());
-                            if let Err(e) = self.config.save() {
-                                tracing::error!("Failed to save config: {}", e);
-                            }
-                            let repo_id = RepoId(path.clone());
-                            self.repo_list.repos.push(RepoEntry {
-                                path,
-                                name,
-                                status: None,
-                                git_op: false,
-                            });
-                            self.action_tx.send(Action::RefreshRepo(repo_id.clone()))?;
-                            self.action_tx.send(Action::SelectRepo(repo_id))?;
-                        }
-                    }
-                    Action::RemoveRepo(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            // Clean up tracking sets for the removed repo
-                            self.pending_status.remove(id);
-                            self.dirty_repos.remove(id);
-                            self.graph_keys.remove(&id.0);
-                            self.remote_keys.remove(&id.0);
-                            let entry = &self.repo_list.repos[idx];
-                            // Remove from pinned if it was pinned
-                            self.config.pinned_repos.retain(|p| *p != entry.path);
-                            // Add to excluded so it won't reappear on rescan
-                            let name = entry.name.clone();
-                            if !self.config.excluded_repos.contains(&name) {
-                                self.config.excluded_repos.push(name);
-                            }
-                            if let Err(e) = self.config.save() {
-                                tracing::error!("Failed to save config: {}", e);
-                            }
-                            self.repo_list.repos.remove(idx);
-                            // Fix selection
-                            if self.repo_list.repos.is_empty() {
-                                self.repo_list.state.select(None);
-                                self.file_list.set_files(
-                                    Vec::new(),
-                                    "",
-                                    RepoId(std::path::PathBuf::new()),
-                                );
-                            } else {
-                                let new_idx = idx.min(self.repo_list.repos.len() - 1);
-                                self.repo_list.select_repo_row(new_idx);
-                                let new_id = RepoId(self.repo_list.repos[new_idx].path.clone());
-                                self.action_tx.send(Action::SelectRepo(new_id))?;
-                            }
-                        }
-                    }
-                    Action::CycleSortOrder => {
-                        self.sort_order = self.sort_order.next();
-                        self.sort_repos();
-                        self.sync_selection();
-                    }
-                    Action::RescanRepos => {
-                        // Clear tracking sets — old paths are stale after rescan
-                        self.pending_status.clear();
-                        self.dirty_repos.clear();
-                        self.graph_keys.clear();
-                        self.remote_keys.clear();
-                        self.local_poll_tick = 0;
-                        // Clear user-added exclusions, save, and re-discover repos
-                        self.config.excluded_repos.clear();
-                        if let Err(e) = self.config.save() {
-                            tracing::error!("Failed to save config: {}", e);
-                        }
-                        let repo_paths = scanner::discover_repos(&self.config);
-                        self.repo_list =
-                            RepoList::new(repo_paths, self.config.submodules.ignore_dirty);
-                        self.repo_list
-                            .register_action_handler(self.action_tx.clone())?;
-                        self.repo_list.init()?;
-                        self.action_tx.send(Action::PollLocal)?;
-                        self.sort_repos();
-                        self.sync_selection();
                     }
                     Action::UpdateAvailable(ref version) => {
                         self.update_version = Some(version.clone());

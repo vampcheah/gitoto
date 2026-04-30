@@ -105,20 +105,37 @@ pub(crate) fn query_status(path: &Path, ignore_dirty_subs: bool) -> color_eyre::
     query_status_with_untracked(path, ignore_dirty_subs, UntrackedMode::default())
 }
 
+#[cfg(test)]
 pub(crate) fn query_status_with_untracked(
     path: &Path,
     ignore_dirty_subs: bool,
     untracked: UntrackedMode,
 ) -> color_eyre::Result<RepoStatus> {
-    query_status_inner(path, false, ignore_dirty_subs, untracked)
+    query_status_inner(
+        path,
+        false,
+        ignore_dirty_subs,
+        untracked,
+        &default_github_hosts(),
+    )
 }
 
-pub(crate) fn query_status_with_fetch_and_untracked(
+pub(crate) fn query_status_with_untracked_and_github_hosts(
     path: &Path,
     ignore_dirty_subs: bool,
     untracked: UntrackedMode,
+    github_hosts: &[String],
 ) -> color_eyre::Result<RepoStatus> {
-    query_status_inner(path, true, ignore_dirty_subs, untracked)
+    query_status_inner(path, false, ignore_dirty_subs, untracked, github_hosts)
+}
+
+pub(crate) fn query_status_with_fetch_untracked_and_github_hosts(
+    path: &Path,
+    ignore_dirty_subs: bool,
+    untracked: UntrackedMode,
+    github_hosts: &[String],
+) -> color_eyre::Result<RepoStatus> {
+    query_status_inner(path, true, ignore_dirty_subs, untracked, github_hosts)
 }
 
 fn query_status_inner(
@@ -126,11 +143,10 @@ fn query_status_inner(
     fetch: bool,
     ignore_dirty_subs: bool,
     untracked: UntrackedMode,
+    github_hosts: &[String],
 ) -> color_eyre::Result<RepoStatus> {
     let started = Instant::now();
     let repo = Repository::open(path)?;
-    let graph_key = graph_cache_key_from_repo(&repo);
-    let remote_key = remote_cache_key_from_repo(&repo);
 
     // Branch name
     let branch = match repo.head() {
@@ -145,10 +161,13 @@ fn query_status_inner(
         false
     };
 
+    let graph_key = graph_cache_key_from_repo(&repo);
+    let remote_key = remote_cache_key_from_repo(&repo);
+
     // Ahead/behind
     let has_upstream = has_upstream(&repo);
     let (ahead, behind) = compute_ahead_behind(&repo);
-    let github_url = github_remote_url(&repo);
+    let github_url = github_remote_url(&repo, github_hosts);
     let has_github_remote = github_url.is_some();
     let has_origin_remote = has_origin_remote(&repo);
 
@@ -398,7 +417,7 @@ fn has_upstream(repo: &Repository) -> bool {
         .is_ok()
 }
 
-fn github_remote_url(repo: &Repository) -> Option<String> {
+fn github_remote_url(repo: &Repository, hosts: &[String]) -> Option<String> {
     let Ok(remotes) = repo.remotes() else {
         return None;
     };
@@ -407,8 +426,12 @@ fn github_remote_url(repo: &Repository) -> Option<String> {
         repo.find_remote(name).ok().and_then(|remote| {
             remote
                 .url()
-                .and_then(github_web_url_from_remote)
-                .or_else(|| remote.pushurl().and_then(github_web_url_from_remote))
+                .and_then(|url| github_web_url_from_remote(url, hosts))
+                .or_else(|| {
+                    remote
+                        .pushurl()
+                        .and_then(|url| github_web_url_from_remote(url, hosts))
+                })
         })
     })
 }
@@ -417,16 +440,17 @@ fn has_origin_remote(repo: &Repository) -> bool {
     repo.find_remote("origin").is_ok()
 }
 
-fn github_web_url_from_remote(url: &str) -> Option<String> {
+#[cfg(test)]
+fn default_github_hosts() -> Vec<String> {
+    vec!["github.com".to_string()]
+}
+
+fn github_web_url_from_remote(url: &str, hosts: &[String]) -> Option<String> {
     let trimmed = url.trim();
-    let path = [
-        "git@github.com:",
-        "ssh://git@github.com/",
-        "https://github.com/",
-        "http://github.com/",
-    ]
-    .iter()
-    .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+    let (host, path) = split_git_remote(trimmed)?;
+    if !hosts.iter().any(|allowed| same_host(allowed, host)) {
+        return None;
+    }
 
     let path = path
         .split(['?', '#'])
@@ -437,7 +461,46 @@ fn github_web_url_from_remote(url: &str) -> Option<String> {
     let mut parts = path.split('/');
     let owner = parts.next().filter(|part| !part.is_empty())?;
     let repo = parts.next().filter(|part| !part.is_empty())?;
-    Some(format!("https://github.com/{owner}/{repo}"))
+    Some(format!("https://{host}/{owner}/{repo}"))
+}
+
+fn split_git_remote(url: &str) -> Option<(&str, &str)> {
+    for scheme in ["git+ssh://", "ssh://", "https://", "http://"] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            let rest = rest
+                .rsplit_once('@')
+                .map(|(_, value)| value)
+                .unwrap_or(rest);
+            let (authority, path) = rest.split_once('/')?;
+            let host = authority
+                .split_once(':')
+                .map(|(host, _port)| host)
+                .unwrap_or(authority);
+            return Some((host, path));
+        }
+    }
+
+    if let Some(rest) = url.strip_prefix("git@") {
+        return rest.split_once(':');
+    }
+
+    url.split_once(':')
+}
+
+fn same_host(allowed: &str, actual: &str) -> bool {
+    normalize_host(allowed).eq_ignore_ascii_case(normalize_host(actual))
+}
+
+fn normalize_host(host: &str) -> &str {
+    let normalized = host
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    normalized
+        .split_once(':')
+        .map(|(host, _port)| host)
+        .unwrap_or(normalized)
 }
 
 /// Collect details for each linked worktree using the git2 API.
@@ -596,20 +659,48 @@ mod tests {
 
     #[test]
     fn test_github_remote_url_parsing() {
+        let hosts = default_github_hosts();
         assert_eq!(
-            github_web_url_from_remote("git@github.com:owner/repo.git").as_deref(),
+            github_web_url_from_remote("git@github.com:owner/repo.git", &hosts).as_deref(),
             Some("https://github.com/owner/repo")
         );
         assert_eq!(
-            github_web_url_from_remote("https://github.com/owner/repo.git").as_deref(),
+            github_web_url_from_remote("https://github.com/owner/repo.git", &hosts).as_deref(),
             Some("https://github.com/owner/repo")
         );
         assert_eq!(
-            github_web_url_from_remote("ssh://git@github.com/owner/repo.git").as_deref(),
+            github_web_url_from_remote("ssh://git@github.com/owner/repo.git", &hosts).as_deref(),
             Some("https://github.com/owner/repo")
         );
         assert_eq!(
-            github_web_url_from_remote("git@example.com:owner/repo.git"),
+            github_web_url_from_remote("git+ssh://git@github.com/owner/repo.git", &hosts)
+                .as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("ssh://deploy@github.com:22/owner/repo.git", &hosts)
+                .as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("github.com:owner/repo.git", &hosts).as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("git@example.com:owner/repo.git", &hosts),
+            None
+        );
+    }
+
+    #[test]
+    fn test_github_enterprise_remote_url_parsing() {
+        let hosts = vec!["git.example.com".to_string()];
+        assert_eq!(
+            github_web_url_from_remote("git@git.example.com:team/repo.git", &hosts).as_deref(),
+            Some("https://git.example.com/team/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("https://github.com/team/repo.git", &hosts),
             None
         );
     }

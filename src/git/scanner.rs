@@ -1,7 +1,8 @@
 use crate::config::Config;
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::PathBuf;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 pub(crate) fn discover_repos(config: &Config) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
@@ -24,6 +25,7 @@ pub(crate) fn discover_repos(config: &Config) -> Vec<PathBuf> {
             .max_depth(config.scan_depth)
             .follow_links(false)
             .into_iter()
+            .filter_entry(|entry| should_descend(entry, config))
             .filter_map(|e| e.ok())
         {
             if entry.file_name() == ".git" && entry.file_type().is_dir() {
@@ -82,6 +84,25 @@ pub(crate) fn discover_repos(config: &Config) -> Vec<PathBuf> {
     }
 
     repos
+}
+
+fn should_descend(entry: &DirEntry, config: &Config) -> bool {
+    if entry.depth() == 0 || !entry.file_type().is_dir() {
+        return true;
+    }
+
+    let name = entry.file_name();
+    if name == OsStr::new(".git") {
+        return true;
+    }
+
+    let name = name.to_string_lossy();
+    !config
+        .watch
+        .watch_exclude_dirs
+        .iter()
+        .any(|dir| dir == &name)
+        && !config.excluded_repos.iter().any(|pattern| pattern == &name)
 }
 
 #[cfg(test)]
@@ -146,5 +167,24 @@ mod tests {
         let repos = discover_repos(&config);
         assert_eq!(repos.len(), 2);
         assert!(repos[0].ends_with("z-repo"));
+    }
+
+    #[test]
+    fn test_watch_excluded_dirs_are_not_traversed() {
+        let tmp = TempDir::new().unwrap();
+        make_repo(tmp.path(), "visible");
+        let ignored = tmp.path().join("node_modules");
+        fs::create_dir_all(&ignored).unwrap();
+        make_repo(&ignored, "hidden");
+
+        let config = Config {
+            root_dirs: vec![tmp.path().to_path_buf()],
+            scan_depth: 3,
+            ..Config::default()
+        };
+
+        let repos = discover_repos(&config);
+        assert_eq!(repos.len(), 1);
+        assert!(repos[0].ends_with("visible"));
     }
 }

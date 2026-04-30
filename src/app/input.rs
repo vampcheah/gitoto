@@ -187,8 +187,7 @@ impl App {
                 if let Some(repo_id) = self.active_repo_id()
                     && let Some(idx) = self.repo_list.resolve_index(&repo_id)
                 {
-                    let entry = &self.repo_list.repos[idx];
-                    let name = entry.name.clone();
+                    let name = self.repo_display_name(idx);
                     self.confirm_dialog
                         .show(format!("Remove {}?", name), Action::RemoveRepo(repo_id));
                 }

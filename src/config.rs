@@ -20,6 +20,8 @@ pub(crate) struct Config {
     #[serde(default)]
     pub ui: UiConfig,
     #[serde(default)]
+    pub github: GitHubConfig,
+    #[serde(default)]
     pub graph: GraphConfig,
     #[serde(default)]
     pub submodules: SubmoduleConfig,
@@ -60,6 +62,20 @@ pub(crate) enum UpdatePosition {
     TopLeft,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RepoNameFormat {
+    /// GitHub repos display as local-folder:github-repo; local-only repos display as folder.
+    #[default]
+    FolderGithub,
+    /// Always display only the local folder name.
+    Folder,
+    /// Display parent-folder:local-folder.
+    ParentFolder,
+    /// Display the full local path.
+    Path,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct UiConfig {
     #[serde(default = "default_frame_rate")]
@@ -68,6 +84,14 @@ pub(crate) struct UiConfig {
     pub check_for_updates: bool,
     #[serde(default)]
     pub update_position: UpdatePosition,
+    #[serde(default)]
+    pub repo_name_format: RepoNameFormat,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GitHubConfig {
+    #[serde(default = "default_github_hosts")]
+    pub hosts: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +214,10 @@ fn default_check_for_updates() -> bool {
     false
 }
 
+fn default_github_hosts() -> Vec<String> {
+    vec!["github.com".to_string()]
+}
+
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
@@ -209,6 +237,15 @@ impl Default for UiConfig {
             frame_rate: default_frame_rate(),
             check_for_updates: default_check_for_updates(),
             update_position: UpdatePosition::default(),
+            repo_name_format: RepoNameFormat::default(),
+        }
+    }
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            hosts: default_github_hosts(),
         }
     }
 }
@@ -222,6 +259,7 @@ impl Default for Config {
             scan_depth: default_scan_depth(),
             watch: WatchConfig::default(),
             ui: UiConfig::default(),
+            github: GitHubConfig::default(),
             graph: GraphConfig::default(),
             submodules: SubmoduleConfig::default(),
             commit: CommitConfig::default(),
@@ -398,10 +436,38 @@ mod tests {
         let mut config = Config::default();
         config.ui.check_for_updates = false;
         config.ui.update_position = UpdatePosition::TopLeft;
+        config.ui.repo_name_format = RepoNameFormat::ParentFolder;
         let serialized = toml::to_string_pretty(&config).unwrap();
         let loaded: Config = toml::from_str(&serialized).unwrap();
         assert!(!loaded.ui.check_for_updates);
         assert_eq!(loaded.ui.update_position, UpdatePosition::TopLeft);
+        assert_eq!(loaded.ui.repo_name_format, RepoNameFormat::ParentFolder);
+    }
+
+    #[test]
+    fn test_repo_name_format_parse() {
+        let toml_str = r#"
+            [ui]
+            repo_name_format = "path"
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.ui.repo_name_format, RepoNameFormat::Path);
+    }
+
+    #[test]
+    fn test_github_hosts_default() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.github.hosts, vec!["github.com"]);
+    }
+
+    #[test]
+    fn test_github_hosts_parse() {
+        let toml_str = r#"
+            [github]
+            hosts = ["github.com", "git.example.com"]
+        "#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.github.hosts, vec!["github.com", "git.example.com"]);
     }
 
     #[test]
