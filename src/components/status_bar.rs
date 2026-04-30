@@ -16,6 +16,7 @@ pub(crate) struct StatusBar {
     pub error: Option<(String, Instant)>,
     pub success: Option<(String, Instant)>,
     pub fast_mode: bool,
+    pub focused_repo: Option<String>,
 }
 
 impl StatusBar {
@@ -25,6 +26,7 @@ impl StatusBar {
             error: None,
             success: None,
             fast_mode: false,
+            focused_repo: None,
         }
     }
 }
@@ -100,7 +102,23 @@ impl Component for StatusBar {
             Span::raw("  "),
             key_span("h"),
             Span::raw(" help"),
+            Span::raw("  "),
+            key_span("o"),
+            Span::raw(" log"),
         ];
+        if let Some(repo) = &self.focused_repo {
+            spans.extend([
+                Span::raw("  "),
+                Span::styled(
+                    format!(" FOCUS {repo} "),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::LightMagenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" Esc unlock"),
+            ]);
+        }
         if self.fast_mode {
             spans.extend([
                 Span::raw("  "),

@@ -296,7 +296,7 @@ function renderAnsi(input, outputHtml) {
     s.replace(/[&<>]/g, (m) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" })[m]);
   for (let i = 0; i < screen.length; i += 1) {
     const line = screen[i].map((cell) => cell.ch).join("");
-    if (line.includes("Script started on") || line.includes("Script done on")) {
+    if (line.includes("Script started on") || line.includes("Script done on") || line.includes("Script")) {
       screen[i] = Array.from({ length: COLS }, blank);
     }
   }
@@ -352,6 +352,19 @@ async function main() {
   await capture("context-menu", [
     { delay: 2200, data: "\x1b[<2;50;2M\x1b[<2;50;2m" },
   ]);
+  await capture("repo-focus", [{ delay: 2200, data: "\r" }]);
+  await capture("github-repo-input", [
+    { delay: 2200, data: "\x1b[<2;50;2M\x1b[<2;50;2m" },
+    { delay: 2600, data: "jjjjjj\r" },
+  ]);
+  await capture(
+    "operation-log",
+    [
+      { delay: 2200, data: "p" },
+      { delay: 4400, data: "o" },
+    ],
+    7000,
+  );
 }
 
 main().catch((error) => {

@@ -20,6 +20,18 @@ This fork shifts the experience closer to VS Code Source Control for multiple re
 
 ![gitoto repo context menu](assets/screenshot-context-menu.png)
 
+### Repo Focus Mode
+
+![gitoto repo focus mode](assets/screenshot-repo-focus.png)
+
+### GitHub Repo Name Input
+
+![gitoto GitHub repo name input](assets/screenshot-github-repo-input.png)
+
+### Operation Log
+
+![gitoto operation log](assets/screenshot-operation-log.png)
+
 ## Install
 
 From this repository:
@@ -38,6 +50,7 @@ Creating GitHub repositories from the context menu requires GitHub CLI:
 
 ```bash
 gh auth login
+gh auth setup-git
 ```
 
 Run it with the default scan root:
@@ -82,6 +95,7 @@ gitoto --fast
 | `r` | Refresh all repo statuses |
 | `R` | Rescan directories for repos |
 | `F` | Toggle fast mode |
+| `o` | Show operation log |
 | `g` | Reload git graph for selected repo |
 | `a` | Add a repo |
 | `c` | Commit selected repo from Repos/Changes |
@@ -109,6 +123,7 @@ gitoto --fast
 |-----|--------|
 | `j` / `Down` | Next repo |
 | `k` / `Up` | Previous repo |
+| `Enter` / double click | Focus this repo in Changes and Git Graph |
 | `w` | Toggle linked worktrees |
 | Right click | Open context menu; repos without a GitHub remote can create a private or public GitHub repo |
 

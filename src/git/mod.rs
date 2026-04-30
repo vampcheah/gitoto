@@ -35,12 +35,12 @@ pub(crate) fn publish(repo_path: &Path, branch: &str) -> Result<String> {
     run_git(repo_path, &["push", "-u", "origin", branch])
 }
 
-pub(crate) fn create_github_repo(repo_path: &Path, private: bool) -> Result<String> {
-    let name = repo_path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| eyre!("invalid repository name"))?;
+pub(crate) fn create_github_repo(repo_path: &Path, name: &str, private: bool) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(eyre!("repository name is empty"));
+    }
+    ensure_github_auth()?;
     let remote = github_remote_name(repo_path)?;
     let visibility = if private { "--private" } else { "--public" };
 
@@ -59,6 +59,33 @@ pub(crate) fn create_github_repo(repo_path: &Path, private: bool) -> Result<Stri
         .context("failed to run gh; install GitHub CLI and run `gh auth login`")?;
 
     command_output_to_result("gh repo create", output)
+}
+
+fn ensure_github_auth() -> Result<()> {
+    let mut command = Command::new("gh");
+    command.args(["auth", "status"]);
+    configure_noninteractive(&mut command);
+    command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    let output = command
+        .output()
+        .context("failed to run gh; install GitHub CLI and run `gh auth login`")?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let detail = stderr
+        .lines()
+        .chain(stdout.lines())
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("not logged in to GitHub")
+        .trim();
+    Err(eyre!(
+        "GitHub authentication required: {detail}. Run `gh auth login` and `gh auth setup-git`."
+    ))
 }
 
 fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {

@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -14,6 +14,7 @@ use crate::components::confirm_dialog::ConfirmDialog;
 use crate::components::context_menu::{ContextMenu, RepoMenuState};
 use crate::components::file_list::FileList;
 use crate::components::git_graph::GitGraph;
+use crate::components::github_repo_input::GitHubRepoInput;
 use crate::components::notice_dialog::NoticeDialog;
 use crate::components::path_input::PathInput;
 use crate::components::repo_list::RepoEntry;
@@ -144,6 +145,7 @@ pub(crate) struct App {
     confirm_dialog: ConfirmDialog,
     notice_dialog: NoticeDialog,
     commit_input: CommitInput,
+    github_repo_input: GitHubRepoInput,
     context_menu: ContextMenu,
     path_input: PathInput,
     status_bar: StatusBar,
@@ -163,6 +165,8 @@ pub(crate) struct App {
     border_frac: [f64; 2],
     /// Single-repo workspace entered from double click / Enter on a repo row.
     focused_repo: Option<RepoId>,
+    operation_log: VecDeque<String>,
+    show_operation_log: bool,
     /// Newer version available (set by background update check)
     update_version: Option<String>,
     /// Where to render the update notification
@@ -226,6 +230,7 @@ impl App {
             confirm_dialog: ConfirmDialog::new(),
             notice_dialog: NoticeDialog::new(),
             commit_input: CommitInput::new(),
+            github_repo_input: GitHubRepoInput::new(),
             context_menu: ContextMenu::new(),
             path_input: PathInput::new(),
             status_bar: StatusBar::new(),
@@ -241,6 +246,8 @@ impl App {
             dragging_border: None,
             border_frac: [0.25, 0.50],
             focused_repo: None,
+            operation_log: VecDeque::new(),
+            show_operation_log: false,
             update_version: None,
             update_position,
             show_help: false,
@@ -334,6 +341,20 @@ impl App {
                 .selected_index()
                 .map(|idx| RepoId(self.repo_list.repos[idx].path.clone()))
         })
+    }
+
+    fn focused_repo_name(&self) -> Option<String> {
+        self.focused_repo
+            .as_ref()
+            .and_then(|id| self.repo_list.resolve_index(id))
+            .map(|idx| self.repo_list.repos[idx].name.clone())
+    }
+
+    fn add_operation_log(&mut self, message: impl Into<String>) {
+        if self.operation_log.len() >= 50 {
+            self.operation_log.pop_front();
+        }
+        self.operation_log.push_back(message.into());
     }
 
     fn spawn_status_query(
@@ -878,6 +899,9 @@ impl App {
                     Action::HideContextMenu => {
                         self.context_menu.hide();
                     }
+                    Action::ToggleOperationLog => {
+                        self.show_operation_log = !self.show_operation_log;
+                    }
                     Action::ToggleFastMode => {
                         self.toggle_fast_mode();
                         self.action_tx.send(Action::PollLocal)?;
@@ -902,6 +926,43 @@ impl App {
                     Action::UpdateCommitMessage(ref _message) => {}
                     Action::CancelCommit => {
                         self.commit_input.hide();
+                    }
+                    Action::StartCreateGitHubRepo { ref id, private } => {
+                        self.context_menu.hide();
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let entry = &self.repo_list.repos[idx];
+                            self.github_repo_input
+                                .show(id.clone(), private, entry.name.clone());
+                        }
+                    }
+                    Action::UpdateGitHubRepoName(ref _name) => {}
+                    Action::CancelCreateGitHubRepo => {
+                        self.github_repo_input.hide();
+                    }
+                    Action::ConfirmCreateGitHubRepo => {
+                        let Some(repo_id) = self.github_repo_input.repo_id() else {
+                            continue;
+                        };
+                        let repo_name = self.github_repo_input.name().trim().to_string();
+                        if repo_name.is_empty() {
+                            self.error_message =
+                                Some(("Repository name is empty".to_string(), Instant::now()));
+                            continue;
+                        }
+                        if !is_valid_github_repo_name(&repo_name) {
+                            self.error_message = Some((
+                                "Repository name can only contain letters, numbers, '.', '_' and '-'"
+                                    .to_string(),
+                                Instant::now(),
+                            ));
+                            continue;
+                        }
+                        self.action_tx.send(Action::CreateGitHubRepo {
+                            id: repo_id,
+                            private: self.github_repo_input.private(),
+                            name: repo_name,
+                        })?;
+                        self.github_repo_input.hide();
                     }
                     Action::ConfirmCommit => {
                         let Some(repo_id) = self.commit_input.repo_id() else {
@@ -986,24 +1047,48 @@ impl App {
                             );
                         }
                     }
-                    Action::CreateGitHubRepo { ref id, private } => {
+                    Action::CreateGitHubRepo {
+                        ref id,
+                        private,
+                        ref name,
+                    } => {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &mut self.repo_list.repos[idx];
                             entry.git_op = true;
                             let path = entry.path.clone();
                             let repo_id = id.clone();
+                            let repo_name = name.clone();
+                            let success_name = name.clone();
                             let visibility = if private { "private" } else { "public" };
                             self.spawn_git_operation(
                                 repo_id,
-                                move || crate::git::create_github_repo(&path, private),
-                                move |_| format!("Created {visibility} GitHub repo"),
+                                move || crate::git::create_github_repo(&path, &repo_name, private),
+                                move |_| format!("Created {visibility} GitHub repo {success_name}"),
                                 Some("Create GitHub repo failed"),
                             );
                         }
                     }
+                    Action::GitPullRebase(ref id) => {
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let name = self.repo_list.repos[idx].name.clone();
+                            self.confirm_dialog.show(
+                                format!("Pull --rebase {name}?"),
+                                Action::RunGitPullRebase(id.clone()),
+                            );
+                        }
+                    }
+                    Action::GitPullSubmodules(ref id) => {
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let name = self.repo_list.repos[idx].name.clone();
+                            self.confirm_dialog.show(
+                                format!("Pull submodules for {name}?"),
+                                Action::RunGitPullSubmodules(id.clone()),
+                            );
+                        }
+                    }
                     Action::GitPull(ref id)
-                    | Action::GitPullRebase(ref id)
-                    | Action::GitPullSubmodules(ref id) => {
+                    | Action::RunGitPullRebase(ref id)
+                    | Action::RunGitPullSubmodules(ref id) => {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &mut self.repo_list.repos[idx];
                             let branch = entry
@@ -1013,8 +1098,8 @@ impl App {
                                 .unwrap_or_default();
                             let mut git_args = match action {
                                 Action::GitPull(_) => git_args(&["pull"]),
-                                Action::GitPullRebase(_) => git_args(&["pull", "--rebase"]),
-                                Action::GitPullSubmodules(_) => {
+                                Action::RunGitPullRebase(_) => git_args(&["pull", "--rebase"]),
+                                Action::RunGitPullSubmodules(_) => {
                                     git_args(&["pull", "--recurse-submodules"])
                                 }
                                 _ => unreachable!(),
@@ -1036,9 +1121,18 @@ impl App {
                             );
                         }
                     }
+                    Action::GitSubmoduleUpdateLatest(ref id) => {
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let name = self.repo_list.repos[idx].name.clone();
+                            self.confirm_dialog.show(
+                                format!("Pull latest in all submodules for {name}?"),
+                                Action::RunGitSubmoduleUpdateLatest(id.clone()),
+                            );
+                        }
+                    }
                     Action::GitSubmoduleUpdate(ref id)
                     | Action::GitSubmoduleSync(ref id)
-                    | Action::GitSubmoduleUpdateLatest(ref id) => {
+                    | Action::RunGitSubmoduleUpdateLatest(ref id) => {
                         if let Some(idx) = self.repo_list.resolve_index(id) {
                             let entry = &mut self.repo_list.repos[idx];
                             let git_args = match action {
@@ -1046,7 +1140,7 @@ impl App {
                                     git_args(&["submodule", "update", "--init", "--recursive"])
                                 }
                                 Action::GitSubmoduleSync(_) => git_args(&["submodule", "sync"]),
-                                Action::GitSubmoduleUpdateLatest(_) => git_args(&[
+                                Action::RunGitSubmoduleUpdateLatest(_) => git_args(&[
                                     "submodule",
                                     "foreach",
                                     "git",
@@ -1073,6 +1167,7 @@ impl App {
                         ref message,
                     } => {
                         self.success_message = Some((message.clone(), Instant::now()));
+                        self.add_operation_log(message.clone());
                         self.action_tx.send(Action::RefreshRepo(id.clone()))?;
                     }
                     Action::ShowDiff(ref id, ref file_path) => {
@@ -1456,6 +1551,7 @@ impl App {
                     }
                     Action::Error(ref msg) => {
                         tracing::debug!("{}", msg);
+                        self.add_operation_log(format!("Error: {msg}"));
                         // Sanitize: single line, max 120 chars for status bar
                         let clean: String = msg
                             .chars()
@@ -1470,6 +1566,7 @@ impl App {
                     }
                     Action::Notice(ref msg) => {
                         tracing::debug!("{}", msg);
+                        self.add_operation_log(format!("Notice: {msg}"));
                         self.notice_dialog.show(msg.clone());
                     }
                     _ => {
@@ -1531,6 +1628,14 @@ impl App {
             return Ok(());
         }
 
+        // GitHub repository name input gets priority over panel shortcuts.
+        if self.github_repo_input.visible {
+            if let Some(action) = self.github_repo_input.handle_key_event(key)? {
+                self.action_tx.send(action)?;
+            }
+            return Ok(());
+        }
+
         // Search input gets priority when active
         if self.focus == FocusPanel::Graph && self.git_graph.search_visible() {
             self.git_graph.handle_search_key(key)?;
@@ -1570,6 +1675,16 @@ impl App {
         if matches!(key.code, KeyCode::Char('h') | KeyCode::Char('?')) {
             self.show_help = true;
             self.help_page = 0;
+            return Ok(());
+        }
+
+        if self.show_operation_log {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('o') | KeyCode::Char('q') => {
+                    self.show_operation_log = false;
+                }
+                _ => {}
+            }
             return Ok(());
         }
 
@@ -1636,6 +1751,9 @@ impl App {
             }
             KeyCode::Char('F') => {
                 self.action_tx.send(Action::ToggleFastMode)?;
+            }
+            KeyCode::Char('o') => {
+                self.action_tx.send(Action::ToggleOperationLog)?;
             }
             KeyCode::Char('g') => {
                 self.action_tx.send(Action::ShowGitGraph)?;
@@ -1869,12 +1987,14 @@ impl App {
         self.status_bar.error = self.error_message.clone();
         self.status_bar.success = self.success_message.clone();
         self.status_bar.fast_mode = self.fast_mode;
+        self.status_bar.focused_repo = self.focused_repo_name();
         self.status_bar.draw(frame, status_area)?;
 
         // Overlays rendered last
         self.context_menu.draw(frame, area)?;
         self.path_input.draw(frame, area);
         self.commit_input.draw(frame, area);
+        self.github_repo_input.draw(frame, area);
         self.confirm_dialog.draw(frame, area);
         self.notice_dialog.draw(frame, area)?;
 
@@ -1888,11 +2008,58 @@ impl App {
             self.draw_help(frame, main_area);
         }
 
+        if self.show_operation_log {
+            self.draw_operation_log(frame, main_area);
+        }
+
         Ok(())
     }
 }
 
 impl App {
+    fn draw_operation_log(&self, frame: &mut ratatui::Frame, area: Rect) {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::{Line, Span};
+        use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+
+        let width = 84u16.min(area.width.saturating_sub(4)).max(30);
+        let height = 14u16.min(area.height.saturating_sub(2)).max(6);
+        let x = area.x + (area.width.saturating_sub(width)) / 2;
+        let y = area.y + (area.height.saturating_sub(height)) / 2;
+        let rect = Rect::new(x, y, width, height);
+        let max_lines = height.saturating_sub(2) as usize;
+
+        let mut lines: Vec<Line> = self
+            .operation_log
+            .iter()
+            .rev()
+            .take(max_lines.saturating_sub(1))
+            .map(|entry| Line::from(Span::raw(entry.clone())))
+            .collect();
+        if lines.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No operations yet",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "Esc/o closes",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .title(" Operation Log ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            rect,
+        );
+    }
+
     fn draw_update_notification(&self, frame: &mut ratatui::Frame, area: Rect, version: &str) {
         use ratatui::style::{Color, Style};
         use ratatui::text::{Line, Span};
@@ -1967,6 +2134,7 @@ impl App {
                     item("r", "Refresh all repo statuses"),
                     item("R", "Rescan configured directories"),
                     item("F", "Toggle fast mode"),
+                    item("o", "Show operation log"),
                     item("g", "Reload graph for selected repo"),
                     item("a", "Add a repository path"),
                     item("y", "Copy selected item to clipboard"),
@@ -1977,6 +2145,7 @@ impl App {
                 vec![
                     item("j / Down", "Select next repo or worktree"),
                     item("k / Up", "Select previous repo or worktree"),
+                    item("Enter", "Focus selected repo in Changes and Graph"),
                     item("w", "Toggle linked worktrees"),
                     item("c", "Commit all changes in selected repo"),
                     item("p", "Push selected repo when upstream exists"),
@@ -2083,4 +2252,12 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     result
+}
+
+fn is_valid_github_repo_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
