@@ -58,6 +58,7 @@ pub(crate) enum Action {
     },
     HideContextMenu,
     CopyPath(RepoId),
+    OpenGitHub(RepoId),
     StartCommit(RepoId),
     UpdateCommitMessage(String),
     ConfirmCommit,

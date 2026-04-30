@@ -79,7 +79,7 @@ gitoto --fast
 - `Esc` cancels commit input.
 - `p` pushes the selected repo only when the branch has an upstream.
 - `P` publishes the selected branch with `git push -u origin <branch>`.
-- The repo context menu can create a private or public GitHub repository when no GitHub remote exists.
+- The repo context menu can open the GitHub page, create a private or public GitHub repository when no GitHub remote exists, and remove `origin` with confirmation.
 - Commit, push, publish, and GitHub repository creation failures are shown in the status bar.
 - The original dashboard, file list, diff view, commit graph, worktree handling, ahead/behind status, and context menu are preserved.
 - `rustls-webpki` is locked to a patched version, and CI includes dependency auditing.
@@ -125,7 +125,7 @@ gitoto --fast
 | `k` / `Up` | Previous repo |
 | `Enter` / double click | Focus this repo in Changes and Git Graph |
 | `w` | Toggle linked worktrees |
-| Right click | Open context menu; repos without a GitHub remote can create a private or public GitHub repo |
+| Right click | Open context menu; GitHub repos can open in the browser, and repos without a GitHub remote can create a private or public GitHub repo |
 
 ### Changes Panel
 

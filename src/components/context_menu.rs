@@ -18,6 +18,7 @@ enum MenuAction {
     OpenGraph,
     Refresh,
     CopyPath,
+    OpenGitHub,
     Commit,
     Push,
     Publish,
@@ -106,6 +107,13 @@ impl ContextMenu {
                 action: MenuAction::Publish,
             },
         ];
+
+        if repo_state.has_github_remote {
+            self.items.push(MenuItem {
+                label: "Open GitHub".into(),
+                action: MenuAction::OpenGitHub,
+            });
+        }
 
         if !repo_state.has_github_remote {
             self.items.push(MenuItem {
@@ -215,6 +223,7 @@ impl ContextMenu {
             MenuAction::OpenGraph => Action::ShowRepoGitGraph(id),
             MenuAction::Refresh => Action::RefreshRepo(id),
             MenuAction::CopyPath => Action::CopyPath(id),
+            MenuAction::OpenGitHub => Action::OpenGitHub(id),
             MenuAction::Commit => Action::StartCommit(id),
             MenuAction::Push => Action::GitPush(id),
             MenuAction::Publish => Action::GitPublish(id),

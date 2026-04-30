@@ -3,6 +3,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -69,6 +70,36 @@ enum StatusFailure {
 
 fn git_args(args: &[&str]) -> Vec<String> {
     args.iter().map(|arg| (*arg).to_string()).collect()
+}
+
+fn open_browser_url(url: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg(url);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", "", url]);
+        command
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(url);
+        command
+    };
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
 }
 
 /// RAII guard that sends `StatusQueryDone` if the spawned task exits
@@ -922,6 +953,28 @@ impl App {
                             let encoded = base64_encode(path_str.as_bytes());
                             let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", encoded);
                             let _ = std::io::stdout().flush();
+                        }
+                    }
+                    Action::OpenGitHub(ref id) => {
+                        if let Some(idx) = self.repo_list.resolve_index(id) {
+                            let url = self.repo_list.repos[idx]
+                                .status
+                                .as_ref()
+                                .and_then(|status| status.github_url.as_deref());
+                            match url {
+                                Some(url) => {
+                                    if let Err(err) = open_browser_url(url) {
+                                        self.action_tx.send(Action::Notice(format!(
+                                            "Open GitHub failed: {err}"
+                                        )))?;
+                                    }
+                                }
+                                None => {
+                                    self.action_tx.send(Action::Notice(
+                                        "This repo has no GitHub remote".to_string(),
+                                    ))?;
+                                }
+                            }
                         }
                     }
                     Action::StartCommit(ref id) => {

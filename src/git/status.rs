@@ -21,6 +21,8 @@ pub(crate) struct RepoStatus {
     pub fetch_failed: bool,
     /// True when any configured remote points at github.com.
     pub has_github_remote: bool,
+    /// Browser URL for the first GitHub remote, when available.
+    pub github_url: Option<String>,
     /// True when the repo has an `origin` remote.
     pub has_origin_remote: bool,
     /// Lightweight snapshot of HEAD/refs/worktree heads used to avoid graph reloads.
@@ -146,7 +148,8 @@ fn query_status_inner(
     // Ahead/behind
     let has_upstream = has_upstream(&repo);
     let (ahead, behind) = compute_ahead_behind(&repo);
-    let has_github_remote = has_github_remote(&repo);
+    let github_url = github_remote_url(&repo);
+    let has_github_remote = github_url.is_some();
     let has_origin_remote = has_origin_remote(&repo);
 
     // File statuses
@@ -280,6 +283,7 @@ fn query_status_inner(
         has_dirty_submodules,
         fetch_failed,
         has_github_remote,
+        github_url,
         has_origin_remote,
         graph_key,
         remote_key,
@@ -394,14 +398,17 @@ fn has_upstream(repo: &Repository) -> bool {
         .is_ok()
 }
 
-fn has_github_remote(repo: &Repository) -> bool {
+fn github_remote_url(repo: &Repository) -> Option<String> {
     let Ok(remotes) = repo.remotes() else {
-        return false;
+        return None;
     };
 
-    remotes.iter().flatten().any(|name| {
-        repo.find_remote(name).ok().is_some_and(|remote| {
-            remote.url().is_some_and(is_github_url) || remote.pushurl().is_some_and(is_github_url)
+    remotes.iter().flatten().find_map(|name| {
+        repo.find_remote(name).ok().and_then(|remote| {
+            remote
+                .url()
+                .and_then(github_web_url_from_remote)
+                .or_else(|| remote.pushurl().and_then(github_web_url_from_remote))
         })
     })
 }
@@ -410,8 +417,27 @@ fn has_origin_remote(repo: &Repository) -> bool {
     repo.find_remote("origin").is_ok()
 }
 
-fn is_github_url(url: &str) -> bool {
-    url.contains("github.com")
+fn github_web_url_from_remote(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let path = [
+        "git@github.com:",
+        "ssh://git@github.com/",
+        "https://github.com/",
+        "http://github.com/",
+    ]
+    .iter()
+    .find_map(|prefix| trimmed.strip_prefix(prefix))?;
+
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(path)
+        .trim_end_matches('/')
+        .trim_end_matches(".git");
+    let mut parts = path.split('/');
+    let owner = parts.next().filter(|part| !part.is_empty())?;
+    let repo = parts.next().filter(|part| !part.is_empty())?;
+    Some(format!("https://github.com/{owner}/{repo}"))
 }
 
 /// Collect details for each linked worktree using the git2 API.
@@ -561,7 +587,31 @@ mod tests {
         let status = query_status(tmp.path(), false).unwrap();
 
         assert!(status.has_github_remote);
+        assert_eq!(
+            status.github_url.as_deref(),
+            Some("https://github.com/owner/repo")
+        );
         assert!(status.has_origin_remote);
+    }
+
+    #[test]
+    fn test_github_remote_url_parsing() {
+        assert_eq!(
+            github_web_url_from_remote("git@github.com:owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("https://github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            github_web_url_from_remote("git@example.com:owner/repo.git"),
+            None
+        );
     }
 
     #[test]
