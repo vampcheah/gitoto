@@ -37,6 +37,7 @@ pub(crate) enum Action {
     /// Remote fetch poll (no spinner)
     PollFetch,
     ShowGitGraph,
+    ShowRepoGitGraph(RepoId),
     ShowFileList,
     GraphLoaded {
         generation: u64,

@@ -191,6 +191,12 @@ impl RepoList {
         }
     }
 
+    fn emit_open_graph_action(&self) -> Option<Action> {
+        let repo_idx = self.selected_index()?;
+        let id = RepoId(self.repos.get(repo_idx)?.path.clone());
+        Some(Action::ShowRepoGitGraph(id))
+    }
+
     /// Toggle worktree expansion for the repo at the current selection.
     fn toggle_expand(&mut self) {
         let Some(di) = self.state.selected() else {
@@ -333,6 +339,7 @@ impl Component for RepoList {
                 self.toggle_expand();
                 Ok(self.emit_selection_action())
             }
+            KeyCode::Enter => Ok(self.emit_open_graph_action()),
             _ => Ok(None),
         }
     }
@@ -348,16 +355,16 @@ impl Component for RepoList {
                     let visual_row = (mouse.row - content_y) as usize;
                     let idx = visual_row + self.state.offset();
                     if idx < self.display_rows.len() {
-                        // Click on already-selected repo row toggles worktree expansion
-                        if self.state.selected() == Some(idx)
-                            && let Some(DisplayRow::Repo(i)) = self.display_rows.get(idx)
-                            && self.repos[*i]
-                                .status
-                                .as_ref()
-                                .is_some_and(|s| !s.worktree_info.is_empty())
-                        {
-                            self.toggle_expand();
-                            return Ok(self.emit_selection_action());
+                        // A second click on the selected repo row opens its graph.
+                        // Worktree expansion stays on `w` so click/Enter both mean "enter".
+                        if self.state.selected() == Some(idx) {
+                            return match self.display_rows.get(idx) {
+                                Some(DisplayRow::Repo(_)) => Ok(self.emit_open_graph_action()),
+                                Some(DisplayRow::Worktree(_, _)) => {
+                                    Ok(self.emit_selection_action())
+                                }
+                                None => Ok(None),
+                            };
                         }
                         self.state.select(Some(idx));
                         return Ok(self.emit_selection_action());

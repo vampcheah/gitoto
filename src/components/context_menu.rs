@@ -203,7 +203,7 @@ impl ContextMenu {
         let item = self.items.get(idx)?;
         let id = self.repo_id.clone()?;
         let action = match item.action {
-            MenuAction::OpenGraph => Action::ShowGitGraph,
+            MenuAction::OpenGraph => Action::ShowRepoGitGraph(id),
             MenuAction::Refresh => Action::RefreshRepo(id),
             MenuAction::CopyPath => Action::CopyPath(id),
             MenuAction::Commit => Action::StartCommit(id),

@@ -161,6 +161,8 @@ pub(crate) struct App {
     /// Fraction of the vertical layout axis for each border (0.0..1.0).
     /// [0] = repos/changes split, [1] = changes/graph split.
     border_frac: [f64; 2],
+    /// Single-repo workspace entered from double click / Enter on a repo row.
+    focused_repo: Option<RepoId>,
     /// Newer version available (set by background update check)
     update_version: Option<String>,
     /// Where to render the update notification
@@ -238,6 +240,7 @@ impl App {
             success_message: None,
             dragging_border: None,
             border_frac: [0.25, 0.50],
+            focused_repo: None,
             update_version: None,
             update_position,
             show_help: false,
@@ -297,6 +300,40 @@ impl App {
             let path = entry.path.clone();
             self.git_graph.load_repo(path, &name);
         }
+    }
+
+    fn open_repo_graph(&mut self, id: &RepoId) {
+        self.context_menu.hide();
+        self.active_worktree = None;
+        if let Some(idx) = self.repo_list.resolve_index(id) {
+            self.repo_list.select_repo_row(idx);
+            let entry = &self.repo_list.repos[idx];
+            let name = entry.name.clone();
+            let path = entry.path.clone();
+            let files = entry
+                .status
+                .as_ref()
+                .map(|s| s.files.clone())
+                .unwrap_or_default();
+            if let Some(status) = &entry.status {
+                self.graph_keys
+                    .insert(path.clone(), status.graph_key.clone());
+                self.remote_keys
+                    .insert(path.clone(), status.remote_key.clone());
+            }
+            self.file_list.set_files(files, &name, id.clone());
+            self.git_graph.load_repo(path, &name);
+            self.focused_repo = Some(id.clone());
+            self.focus = FocusPanel::Graph;
+        }
+    }
+
+    fn active_repo_id(&self) -> Option<RepoId> {
+        self.focused_repo.clone().or_else(|| {
+            self.repo_list
+                .selected_index()
+                .map(|idx| RepoId(self.repo_list.repos[idx].path.clone()))
+        })
     }
 
     fn spawn_status_query(
@@ -543,6 +580,9 @@ impl App {
                             .resize(ratatui::layout::Rect::new(0, 0, w, h))?;
                     }
                     Action::SelectRepo(ref id) => {
+                        if self.focused_repo.is_some() {
+                            continue;
+                        }
                         self.context_menu.hide();
                         self.active_worktree = None;
                         if let Some(idx) = self.repo_list.resolve_index(id) {
@@ -776,14 +816,13 @@ impl App {
                         }
                     }
                     Action::ShowGitGraph => {
-                        // Force-reload graph for selected repo
-                        self.context_menu.hide();
                         if let Some(entry) = self.repo_list.selected_repo() {
-                            let path = entry.path.clone();
-                            let name = entry.name.clone();
-                            self.git_graph.load_repo(path, &name);
+                            let id = RepoId(entry.path.clone());
+                            self.open_repo_graph(&id);
                         }
-                        self.focus = FocusPanel::Graph;
+                    }
+                    Action::ShowRepoGitGraph(ref id) => {
+                        self.open_repo_graph(id);
                     }
                     Action::ShowFileList => {
                         self.focus = FocusPanel::Changes;
@@ -1549,6 +1588,8 @@ impl App {
                     self.file_list.handle_key_event(key)?;
                 } else if self.focus == FocusPanel::Graph && self.git_graph.has_detail() {
                     self.git_graph.handle_key_event(key)?;
+                } else if self.focused_repo.take().is_some() {
+                    self.focus = FocusPanel::Repos;
                 } else {
                     match self.focus {
                         FocusPanel::Graph => self.focus = FocusPanel::Changes,
@@ -1559,18 +1600,32 @@ impl App {
             }
             KeyCode::Tab => {
                 // Cycle focus right
-                self.focus = match self.focus {
-                    FocusPanel::Repos => FocusPanel::Changes,
-                    FocusPanel::Changes => FocusPanel::Graph,
-                    FocusPanel::Graph => FocusPanel::Repos,
+                self.focus = if self.focused_repo.is_some() {
+                    match self.focus {
+                        FocusPanel::Changes => FocusPanel::Graph,
+                        _ => FocusPanel::Changes,
+                    }
+                } else {
+                    match self.focus {
+                        FocusPanel::Repos => FocusPanel::Changes,
+                        FocusPanel::Changes => FocusPanel::Graph,
+                        FocusPanel::Graph => FocusPanel::Repos,
+                    }
                 };
             }
             KeyCode::BackTab => {
                 // Cycle focus left
-                self.focus = match self.focus {
-                    FocusPanel::Repos => FocusPanel::Graph,
-                    FocusPanel::Changes => FocusPanel::Repos,
-                    FocusPanel::Graph => FocusPanel::Changes,
+                self.focus = if self.focused_repo.is_some() {
+                    match self.focus {
+                        FocusPanel::Graph => FocusPanel::Changes,
+                        _ => FocusPanel::Graph,
+                    }
+                } else {
+                    match self.focus {
+                        FocusPanel::Repos => FocusPanel::Graph,
+                        FocusPanel::Changes => FocusPanel::Repos,
+                        FocusPanel::Graph => FocusPanel::Changes,
+                    }
                 };
             }
             KeyCode::Char('r') => {
@@ -1589,31 +1644,26 @@ impl App {
                 self.action_tx.send(Action::OpenAddRepo)?;
             }
             KeyCode::Char('c') if self.focus != FocusPanel::Graph => {
-                if let Some(idx) = self.repo_list.selected_index() {
-                    let entry = &self.repo_list.repos[idx];
-                    self.action_tx
-                        .send(Action::StartCommit(RepoId(entry.path.clone())))?;
+                if let Some(repo_id) = self.active_repo_id() {
+                    self.action_tx.send(Action::StartCommit(repo_id))?;
                 }
             }
             KeyCode::Char('p') => {
-                if let Some(idx) = self.repo_list.selected_index() {
-                    let entry = &self.repo_list.repos[idx];
-                    self.action_tx
-                        .send(Action::GitPush(RepoId(entry.path.clone())))?;
+                if let Some(repo_id) = self.active_repo_id() {
+                    self.action_tx.send(Action::GitPush(repo_id))?;
                 }
             }
             KeyCode::Char('P') => {
-                if let Some(idx) = self.repo_list.selected_index() {
-                    let entry = &self.repo_list.repos[idx];
-                    self.action_tx
-                        .send(Action::GitPublish(RepoId(entry.path.clone())))?;
+                if let Some(repo_id) = self.active_repo_id() {
+                    self.action_tx.send(Action::GitPublish(repo_id))?;
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(idx) = self.repo_list.selected_index() {
+                if let Some(repo_id) = self.active_repo_id()
+                    && let Some(idx) = self.repo_list.resolve_index(&repo_id)
+                {
                     let entry = &self.repo_list.repos[idx];
                     let name = entry.name.clone();
-                    let repo_id = RepoId(entry.path.clone());
                     self.confirm_dialog
                         .show(format!("Remove {}?", name), Action::RemoveRepo(repo_id));
                 }
@@ -1725,7 +1775,7 @@ impl App {
 
         // Set focus on left click based on which panel was clicked
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            if self.repo_area.contains(pos) {
+            if self.repo_area.contains(pos) && self.focused_repo.is_none() {
                 self.focus = FocusPanel::Repos;
             } else if self.changes_area.contains(pos) {
                 self.focus = FocusPanel::Changes;
