@@ -134,6 +134,22 @@ mod tests {
     }
 
     #[test]
+    fn test_default_scan_depth_finds_third_level_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path().join("one");
+        make_repo(&nested, "deep-repo");
+
+        let config = Config {
+            root_dirs: vec![tmp.path().to_path_buf()],
+            ..Config::default()
+        };
+
+        let repos = discover_repos(&config);
+        assert_eq!(repos.len(), 1);
+        assert!(repos[0].ends_with("deep-repo"));
+    }
+
+    #[test]
     fn test_excluded_repos_are_filtered() {
         let tmp = TempDir::new().unwrap();
         make_repo(tmp.path(), "good-repo");

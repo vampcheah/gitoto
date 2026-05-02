@@ -166,7 +166,7 @@ fn default_root_dirs() -> Vec<PathBuf> {
 }
 
 fn default_scan_depth() -> usize {
-    2
+    3
 }
 
 fn default_debounce_ms() -> u64 {
@@ -334,6 +334,12 @@ mod tests {
         assert!(!config.root_dirs.is_empty());
         let first = &config.root_dirs[0];
         assert!(first.ends_with("Code"));
+    }
+
+    #[test]
+    fn test_default_scan_depth_supports_third_level_git_dirs() {
+        let config = Config::default();
+        assert_eq!(config.scan_depth, 3);
     }
 
     #[test]

@@ -4,8 +4,8 @@
 # Directories to scan for git repositories
 root_dirs = ["~/Code"]
 
-# Maximum depth to walk when discovering repos (default: 2)
-scan_depth = 2
+# Maximum depth to walk when discovering repos (default: 3)
+scan_depth = 3
 
 # Repos to always show at the top of the list
 pinned_repos = []

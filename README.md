@@ -183,7 +183,7 @@ Example:
 
 ```toml
 root_dirs = ["~/Code", "~/projects"]
-scan_depth = 2
+scan_depth = 3
 pinned_repos = []
 excluded_repos = ["node_modules", ".cargo", "target"]
 
