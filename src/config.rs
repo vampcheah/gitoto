@@ -276,7 +276,7 @@ impl Config {
 
     fn load_or_create_at(config_path: &Path) -> Result<Self> {
         if config_path.exists() {
-            let contents = std::fs::read_to_string(&config_path)?;
+            let contents = std::fs::read_to_string(config_path)?;
             let mut config: Config = toml::from_str(&contents)?;
             config.expand_tildes();
             Ok(config)
