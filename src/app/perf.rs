@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::time::Instant;
 
 use crate::app::App;
 use crate::git::status::UntrackedMode;
@@ -31,14 +30,11 @@ impl App {
     pub(super) fn apply_fast_mode(&mut self, enabled: bool) {
         self.fast_mode = enabled;
         self.git_graph.graph_options.show_stats = self.config.graph.show_stats && !enabled;
-        self.success_message = Some((
-            if enabled {
-                "Fast mode enabled".to_string()
-            } else {
-                "Fast mode disabled".to_string()
-            },
-            Instant::now(),
-        ));
+        self.set_success_message(if enabled {
+            "Fast mode enabled".to_string()
+        } else {
+            "Fast mode disabled".to_string()
+        });
     }
 
     pub(super) fn toggle_fast_mode(&mut self) {

@@ -76,7 +76,7 @@ impl App {
                     } else {
                         let new_idx = idx.min(self.repo_list.repos.len() - 1);
                         self.repo_list.select_repo_row(new_idx);
-                        let new_id = RepoId(self.repo_list.repos[new_idx].path.clone());
+                        let new_id = self.repo_list.repos[new_idx].id();
                         self.action_tx.send(Action::SelectRepo(new_id))?;
                     }
                 }

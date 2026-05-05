@@ -2,13 +2,16 @@ use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::{Constraint, Flex, Layout, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 use crate::action::Action;
+use crate::components::layout::centered_rect;
+use crate::components::panel;
+use crate::components::style::{bold_fg_span, fg_span};
 
 pub(crate) struct ConfirmDialog {
     pub visible: bool,
@@ -58,14 +61,7 @@ impl ConfirmDialog {
         }
 
         let width = 40u16.min(area.width.saturating_sub(4));
-        let height = 5u16;
-
-        let [vert] = Layout::vertical([Constraint::Length(height)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [rect] = Layout::horizontal([Constraint::Length(width)])
-            .flex(Flex::Center)
-            .areas(vert);
+        let rect = centered_rect(area, width, 5);
 
         frame.render_widget(Clear, rect);
 
@@ -76,31 +72,23 @@ impl ConfirmDialog {
                 Style::default().add_modifier(Modifier::BOLD),
             )),
             Line::from(vec![
-                Span::styled(
-                    " y",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                bold_fg_span(" y", Color::Green),
                 Span::raw("/"),
-                Span::styled("Enter ", Style::default().fg(Color::Green)),
+                fg_span("Enter ", Color::Green),
                 Span::raw("confirm   "),
-                Span::styled(
-                    "n",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
+                bold_fg_span("n", Color::Red),
                 Span::raw("/"),
-                Span::styled("Esc ", Style::default().fg(Color::Red)),
+                fg_span("Esc ", Color::Red),
                 Span::raw("cancel"),
             ]),
         ];
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Confirm ");
-
-        let paragraph = Paragraph::new(lines).centered().block(block);
+        let paragraph = Paragraph::new(lines)
+            .centered()
+            .block(panel::bordered_block(
+                " Confirm ".to_string(),
+                Color::Yellow,
+            ));
         frame.render_widget(paragraph, rect);
     }
 }

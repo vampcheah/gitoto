@@ -1,22 +1,20 @@
 use crate::config::Config;
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
 pub(crate) fn discover_repos(config: &Config) -> Vec<PathBuf> {
     let mut seen = HashSet::new();
     let mut repos = Vec::new();
 
-    // Pinned repos first
     for pinned in &config.pinned_repos {
         let canonical = pinned.canonicalize().unwrap_or_else(|_| pinned.clone());
-        if canonical.join(".git").exists() && seen.insert(canonical.clone()) {
+        if is_git_repo(&canonical) && seen.insert(canonical.clone()) {
             repos.push(canonical);
         }
     }
 
-    // Discover from root dirs
     for root in &config.root_dirs {
         if !root.exists() {
             continue;
@@ -29,61 +27,65 @@ pub(crate) fn discover_repos(config: &Config) -> Vec<PathBuf> {
             .filter_map(|e| e.ok())
         {
             if entry.file_name() == ".git" && entry.file_type().is_dir() {
-                let repo_path = entry
-                    .path()
-                    .parent()
-                    .unwrap()
-                    .canonicalize()
-                    .unwrap_or_else(|_| entry.path().parent().unwrap().to_path_buf());
-
-                // Check exclusions
-                let repo_name = repo_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                let path_str = repo_path.to_string_lossy();
-                let excluded = config
-                    .excluded_repos
-                    .iter()
-                    .any(|pattern| repo_name == *pattern || path_str.contains(pattern));
-
-                if !excluded && seen.insert(repo_path.clone()) {
+                let repo_path = canonical_parent(entry.path());
+                if !is_excluded_repo(&repo_path, &config.excluded_repos)
+                    && seen.insert(repo_path.clone())
+                {
                     repos.push(repo_path);
                 }
             }
         }
     }
 
-    repos.sort_by(|a, b| {
-        a.file_name()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .cmp(&b.file_name().unwrap_or_default().to_ascii_lowercase())
-    });
-
-    // Re-prepend pinned repos at the top (they were sorted away)
-    let pinned_set: HashSet<PathBuf> = config
-        .pinned_repos
-        .iter()
-        .filter_map(|p| p.canonicalize().ok())
-        .collect();
-
-    if !pinned_set.is_empty() {
-        let mut pinned: Vec<PathBuf> = repos
-            .iter()
-            .filter(|r| pinned_set.contains(*r))
-            .cloned()
-            .collect();
-        let rest: Vec<PathBuf> = repos
-            .into_iter()
-            .filter(|r| !pinned_set.contains(r))
-            .collect();
-        pinned.extend(rest);
-        repos = pinned;
-    }
+    sort_repos_with_pinned_first(&mut repos, &config.pinned_repos);
 
     repos
+}
+
+fn is_git_repo(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+fn canonical_parent(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap();
+    parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf())
+}
+
+fn is_excluded_repo(repo_path: &Path, excluded_repos: &[String]) -> bool {
+    let repo_name = repo_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let path_str = repo_path.to_string_lossy();
+    excluded_repos
+        .iter()
+        .any(|pattern| repo_name == *pattern || path_str.contains(pattern))
+}
+
+fn sort_repos_with_pinned_first(repos: &mut Vec<PathBuf>, pinned_repos: &[PathBuf]) {
+    repos.sort_by_key(|path| path.file_name().unwrap_or_default().to_ascii_lowercase());
+
+    let pinned_set: HashSet<PathBuf> = pinned_repos
+        .iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .collect();
+    if pinned_set.is_empty() {
+        return;
+    }
+
+    let mut pinned = Vec::new();
+    let mut rest = Vec::new();
+    for repo in std::mem::take(repos) {
+        if pinned_set.contains(&repo) {
+            pinned.push(repo);
+        } else {
+            rest.push(repo);
+        }
+    }
+    pinned.extend(rest);
+    *repos = pinned;
 }
 
 fn should_descend(entry: &DirEntry, config: &Config) -> bool {

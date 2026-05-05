@@ -36,31 +36,14 @@ impl RepoWatcher {
 
                 for changed_path in &changed_paths {
                     // Skip events from excluded directories (node_modules, target, etc.)
-                    if changed_path
-                        .components()
-                        .any(|c| exclude_set.contains(c.as_os_str().to_string_lossy().as_ref()))
-                    {
+                    if contains_excluded_component(changed_path, &exclude_set) {
                         continue;
                     }
 
                     // Allow key .git/ files that change on commit/pull/checkout,
                     // but skip noisy internals that cause feedback loops with git2.
-                    if changed_path.components().any(|c| c.as_os_str() == ".git") {
-                        let name = changed_path
-                            .file_name()
-                            .map(|n| n.to_string_lossy())
-                            .unwrap_or_default();
-                        let path_str = changed_path.to_string_lossy();
-                        let is_meaningful = name == "HEAD"
-                            || name == "index"
-                            || name == "MERGE_HEAD"
-                            || name == "REBASE_HEAD"
-                            || name == "COMMIT_EDITMSG"
-                            || name == "packed-refs"
-                            || path_str.contains(".git/refs/");
-                        if !is_meaningful {
-                            continue;
-                        }
+                    if is_git_path(changed_path) && !is_meaningful_git_event(changed_path) {
+                        continue;
                     }
 
                     for repo_path in &paths_for_routing {
@@ -108,4 +91,25 @@ impl RepoWatcher {
             _debouncer: debouncer,
         })
     }
+}
+
+fn contains_excluded_component(path: &std::path::Path, exclude_set: &HashSet<String>) -> bool {
+    path.components()
+        .any(|component| exclude_set.contains(component.as_os_str().to_string_lossy().as_ref()))
+}
+
+fn is_git_path(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".git")
+}
+
+fn is_meaningful_git_event(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    matches!(
+        name.as_ref(),
+        "HEAD" | "index" | "MERGE_HEAD" | "REBASE_HEAD" | "COMMIT_EDITMSG" | "packed-refs"
+    ) || path.to_string_lossy().contains(".git/refs/")
 }

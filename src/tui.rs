@@ -51,7 +51,6 @@ impl Tui {
         })
     }
 
-    #[allow(dead_code)]
     pub fn mouse(mut self, mouse: bool) -> Self {
         self.mouse = mouse;
         self

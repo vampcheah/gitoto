@@ -2,11 +2,36 @@ use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use crate::action::Action;
-use crate::app::helpers::base64_encode;
+use crate::app::helpers::copy_to_clipboard;
 use crate::app::{App, FocusPanel, HELP_PAGE_COUNT};
 use crate::components::Component;
 
 impl App {
+    fn send_optional_action(&self, action: Option<Action>) -> Result<()> {
+        if let Some(action) = action {
+            self.action_tx.send(action)?;
+        }
+        Ok(())
+    }
+
+    fn cycle_focus(&mut self, forward: bool) {
+        self.focus = match (self.focused_repo.is_some(), forward, self.focus) {
+            (true, true, FocusPanel::Changes) | (true, false, FocusPanel::Repos) => {
+                FocusPanel::Graph
+            }
+            (true, true, _) | (true, false, _) => FocusPanel::Changes,
+            (false, true, FocusPanel::Repos) | (false, false, FocusPanel::Graph) => {
+                FocusPanel::Changes
+            }
+            (false, true, FocusPanel::Changes) | (false, false, FocusPanel::Repos) => {
+                FocusPanel::Graph
+            }
+            (false, true, FocusPanel::Graph) | (false, false, FocusPanel::Changes) => {
+                FocusPanel::Repos
+            }
+        };
+    }
+
     pub(super) fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<()> {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.action_tx.send(Action::Quit)?;
@@ -19,30 +44,26 @@ impl App {
         }
 
         if self.confirm_dialog.visible {
-            if let Some(action) = self.confirm_dialog.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.confirm_dialog.handle_key_event(key)?;
+            self.send_optional_action(action)?;
             return Ok(());
         }
 
         if self.path_input.visible {
-            if let Some(action) = self.path_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.path_input.handle_key_event(key)?;
+            self.send_optional_action(action)?;
             return Ok(());
         }
 
         if self.commit_input.visible {
-            if let Some(action) = self.commit_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.commit_input.handle_key_event(key)?;
+            self.send_optional_action(action)?;
             return Ok(());
         }
 
         if self.github_repo_input.visible {
-            if let Some(action) = self.github_repo_input.handle_key_event(key)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.github_repo_input.handle_key_event(key)?;
+            self.send_optional_action(action)?;
             return Ok(());
         }
 
@@ -118,32 +139,10 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                self.focus = if self.focused_repo.is_some() {
-                    match self.focus {
-                        FocusPanel::Changes => FocusPanel::Graph,
-                        _ => FocusPanel::Changes,
-                    }
-                } else {
-                    match self.focus {
-                        FocusPanel::Repos => FocusPanel::Changes,
-                        FocusPanel::Changes => FocusPanel::Graph,
-                        FocusPanel::Graph => FocusPanel::Repos,
-                    }
-                };
+                self.cycle_focus(true);
             }
             KeyCode::BackTab => {
-                self.focus = if self.focused_repo.is_some() {
-                    match self.focus {
-                        FocusPanel::Graph => FocusPanel::Changes,
-                        _ => FocusPanel::Graph,
-                    }
-                } else {
-                    match self.focus {
-                        FocusPanel::Repos => FocusPanel::Graph,
-                        FocusPanel::Changes => FocusPanel::Repos,
-                        FocusPanel::Graph => FocusPanel::Changes,
-                    }
-                };
+                self.cycle_focus(false);
             }
             KeyCode::Char('r') => {
                 self.action_tx.send(Action::RefreshAll)?;
@@ -172,10 +171,7 @@ impl App {
                 if let Some(repo_id) = self.active_repo_id() {
                     self.action_tx.send(Action::GitPush(repo_id))?;
                 } else {
-                    self.error_message = Some((
-                        "No repository selected".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    self.set_error_message("No repository selected");
                 }
             }
             KeyCode::Char('P') => {
@@ -185,9 +181,8 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some(repo_id) = self.active_repo_id()
-                    && let Some(idx) = self.repo_list.resolve_index(&repo_id)
+                    && let Some(name) = self.repo_list.display_name_for_id(&repo_id)
                 {
-                    let name = self.repo_display_name(idx);
                     self.confirm_dialog
                         .show(format!("Remove {}?", name), Action::RemoveRepo(repo_id));
                 }
@@ -205,27 +200,21 @@ impl App {
                     FocusPanel::Graph => self.git_graph.selected_text(),
                 };
                 if let Some(text) = text {
-                    use std::io::Write;
-                    let encoded = base64_encode(text.as_bytes());
-                    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", encoded);
-                    let _ = std::io::stdout().flush();
+                    copy_to_clipboard(&text);
                 }
             }
             _ => match self.focus {
                 FocusPanel::Repos => {
-                    if let Some(action) = self.repo_list.handle_key_event(key)? {
-                        self.action_tx.send(action)?;
-                    }
+                    let action = self.repo_list.handle_key_event(key)?;
+                    self.send_optional_action(action)?;
                 }
                 FocusPanel::Changes => {
-                    if let Some(action) = self.file_list.handle_key_event(key)? {
-                        self.action_tx.send(action)?;
-                    }
+                    let action = self.file_list.handle_key_event(key)?;
+                    self.send_optional_action(action)?;
                 }
                 FocusPanel::Graph => {
-                    if let Some(action) = self.git_graph.handle_key_event(key)? {
-                        self.action_tx.send(action)?;
-                    }
+                    let action = self.git_graph.handle_key_event(key)?;
+                    self.send_optional_action(action)?;
                 }
             },
         }
@@ -298,13 +287,11 @@ impl App {
         }
 
         if self.repo_area.contains(pos) {
-            if let Some(action) = self.repo_list.handle_mouse_event(mouse)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.repo_list.handle_mouse_event(mouse)?;
+            self.send_optional_action(action)?;
         } else if self.changes_area.contains(pos) {
-            if let Some(action) = self.file_list.handle_mouse_event(mouse)? {
-                self.action_tx.send(action)?;
-            }
+            let action = self.file_list.handle_mouse_event(mouse)?;
+            self.send_optional_action(action)?;
         } else if self.graph_area.contains(pos)
             && let Some(action) = self.git_graph.handle_mouse_event(mouse)?
         {

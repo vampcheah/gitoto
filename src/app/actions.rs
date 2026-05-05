@@ -1,49 +1,119 @@
 use color_eyre::Result;
-use std::time::Instant;
+use std::path::PathBuf;
 
 use crate::action::Action;
 use crate::app::App;
 use crate::app::helpers::git_args;
+use crate::repo_id::RepoId;
+
+#[derive(Default)]
+struct BranchActionState {
+    branch: String,
+    has_upstream: bool,
+    ahead: usize,
+}
 
 impl App {
+    fn action_repo_name(&self, idx: usize) -> String {
+        self.repo_list.repos[idx].display_name_for_format(self.config.ui.repo_name_format, false)
+    }
+
+    fn branch_action_state(&self, idx: usize) -> BranchActionState {
+        self.repo_list.repos[idx]
+            .status
+            .as_ref()
+            .map(|status| BranchActionState {
+                branch: status.branch.clone(),
+                has_upstream: status.has_upstream,
+                ahead: status.ahead,
+            })
+            .unwrap_or_default()
+    }
+
+    fn confirm_repo_action(
+        &mut self,
+        id: &RepoId,
+        prompt: impl FnOnce(&str) -> String,
+        action: Action,
+    ) {
+        if let Some(idx) = self.repo_list.resolve_index(id) {
+            let name = self.action_repo_name(idx);
+            self.confirm_dialog.show(prompt(&name), action);
+        }
+    }
+
+    fn spawn_git_args_operation(
+        &mut self,
+        idx: usize,
+        id: &RepoId,
+        git_args: Vec<String>,
+        progress: String,
+        success: String,
+    ) {
+        self.spawn_repo_operation(
+            idx,
+            id,
+            progress,
+            move |path| crate::git::run_git_args(&path, &git_args),
+            move |_| success,
+            None,
+        );
+    }
+
+    pub(super) fn spawn_repo_operation<F, M>(
+        &mut self,
+        idx: usize,
+        id: &RepoId,
+        progress: impl Into<String>,
+        operation: F,
+        success_message: M,
+        error_context: Option<&'static str>,
+    ) where
+        F: FnOnce(PathBuf) -> Result<String> + Send + 'static,
+        M: FnOnce(String) -> String + Send + 'static,
+    {
+        let entry = &mut self.repo_list.repos[idx];
+        entry.git_op = true;
+        let path = entry.path.clone();
+        self.set_success_message(progress.into());
+        self.spawn_git_operation(
+            id.clone(),
+            move || operation(path),
+            success_message,
+            error_context,
+        );
+    }
+
     pub(super) fn handle_git_action(&mut self, action: &Action) -> Result<bool> {
         match action {
             Action::GitPush(id) => {
                 if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let entry = &mut self.repo_list.repos[idx];
-                    let (branch, has_upstream, ahead) = entry
-                        .status
-                        .as_ref()
-                        .map(|s| (s.branch.clone(), s.has_upstream, s.ahead))
-                        .unwrap_or_default();
+                    let BranchActionState {
+                        branch,
+                        has_upstream,
+                        ahead,
+                    } = self.branch_action_state(idx);
                     if branch.is_empty() || branch == "(no branch)" || branch == "HEAD" {
-                        self.error_message =
-                            Some(("Cannot push detached HEAD".to_string(), Instant::now()));
+                        self.set_error_message("Cannot push detached HEAD");
                         return Ok(true);
                     }
                     if !has_upstream {
-                        self.error_message = Some((
-                            format!("Branch '{branch}' has no upstream; press P to publish"),
-                            Instant::now(),
+                        self.set_error_message(format!(
+                            "Branch '{branch}' has no upstream; press P to publish"
                         ));
                         return Ok(true);
                     }
                     if ahead == 0 {
-                        self.success_message =
-                            Some(("Nothing to push".to_string(), Instant::now()));
+                        self.set_success_message("Nothing to push");
                         return Ok(true);
                     }
-                    entry.git_op = true;
-                    let push_target =
-                        entry.display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.success_message =
-                        Some((format!("Pushing to {push_target}..."), Instant::now()));
-                    let path = entry.path.clone();
-                    let repo_id = id.clone();
+                    let push_target = self.action_repo_name(idx);
                     let success_target = push_target.clone();
-                    self.spawn_git_operation(
-                        repo_id,
-                        move || crate::git::push(&path),
+                    self.spawn_repo_operation(
+                        idx,
+                        id,
+                        format!("Pushing to {push_target}..."),
+                        |path| crate::git::push(&path),
                         move |_| format!("Pushed {success_target}"),
                         None,
                     );
@@ -52,24 +122,15 @@ impl App {
             }
             Action::GitPublish(id) => {
                 if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let entry = &mut self.repo_list.repos[idx];
-                    let branch = entry
-                        .status
-                        .as_ref()
-                        .map(|s| s.branch.clone())
-                        .unwrap_or_default();
-                    entry.git_op = true;
-                    let publish_target =
-                        entry.display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.success_message =
-                        Some((format!("Publishing {publish_target}..."), Instant::now()));
-                    let path = entry.path.clone();
-                    let repo_id = id.clone();
+                    let publish_target = self.action_repo_name(idx);
+                    let branch = self.branch_action_state(idx).branch;
                     let success_branch = branch.clone();
                     let success_target = publish_target.clone();
-                    self.spawn_git_operation(
-                        repo_id,
-                        move || crate::git::publish(&path, &branch),
+                    self.spawn_repo_operation(
+                        idx,
+                        id,
+                        format!("Publishing {publish_target}..."),
+                        move |path| crate::git::publish(&path, &branch),
                         move |_| format!("Published {success_target}:{success_branch}"),
                         Some("Publish failed"),
                     );
@@ -78,21 +139,15 @@ impl App {
             }
             Action::CreateGitHubRepo { id, private, name } => {
                 if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let entry = &mut self.repo_list.repos[idx];
-                    entry.git_op = true;
                     let private = *private;
                     let visibility = if private { "private" } else { "public" };
-                    self.success_message = Some((
-                        format!("Creating {visibility} GitHub repo {name}..."),
-                        Instant::now(),
-                    ));
-                    let path = entry.path.clone();
-                    let repo_id = id.clone();
                     let repo_name = name.clone();
                     let success_name = name.clone();
-                    self.spawn_git_operation(
-                        repo_id,
-                        move || crate::git::create_github_repo(&path, &repo_name, private),
+                    self.spawn_repo_operation(
+                        idx,
+                        id,
+                        format!("Creating {visibility} GitHub repo {name}..."),
+                        move |path| crate::git::create_github_repo(&path, &repo_name, private),
                         move |_| format!("Created {visibility} GitHub repo {success_name}"),
                         Some("Create GitHub repo failed"),
                     );
@@ -100,36 +155,27 @@ impl App {
                 Ok(true)
             }
             Action::GitPullRebase(id) => {
-                if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let name = self.repo_list.repos[idx]
-                        .display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.confirm_dialog.show(
-                        format!("Pull --rebase {name}?"),
-                        Action::RunGitPullRebase(id.clone()),
-                    );
-                }
+                self.confirm_repo_action(
+                    id,
+                    |name| format!("Pull --rebase {name}?"),
+                    Action::RunGitPullRebase(id.clone()),
+                );
                 Ok(true)
             }
             Action::GitPullSubmodules(id) => {
-                if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let name = self.repo_list.repos[idx]
-                        .display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.confirm_dialog.show(
-                        format!("Pull submodules for {name}?"),
-                        Action::RunGitPullSubmodules(id.clone()),
-                    );
-                }
+                self.confirm_repo_action(
+                    id,
+                    |name| format!("Pull submodules for {name}?"),
+                    Action::RunGitPullSubmodules(id.clone()),
+                );
                 Ok(true)
             }
             Action::RemoveOriginRemote(id) => {
-                if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let name = self.repo_list.repos[idx]
-                        .display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.confirm_dialog.show(
-                        format!("Remove origin remote from {name}?"),
-                        Action::RunRemoveOriginRemote(id.clone()),
-                    );
-                }
+                self.confirm_repo_action(
+                    id,
+                    |name| format!("Remove origin remote from {name}?"),
+                    Action::RunRemoveOriginRemote(id.clone()),
+                );
                 Ok(true)
             }
             Action::GitPull(id)
@@ -137,128 +183,75 @@ impl App {
             | Action::RunGitPullSubmodules(id)
             | Action::RunRemoveOriginRemote(id) => {
                 if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let entry = &mut self.repo_list.repos[idx];
-                    let branch = entry
-                        .status
-                        .as_ref()
-                        .map(|s| s.branch.clone())
-                        .unwrap_or_default();
-                    let should_add_origin_branch =
-                        !matches!(action, Action::RunRemoveOriginRemote(_));
-                    let mut git_args = match action {
-                        Action::GitPull(_) => git_args(&["pull"]),
-                        Action::RunGitPullRebase(_) => git_args(&["pull", "--rebase"]),
-                        Action::RunGitPullSubmodules(_) => {
-                            git_args(&["pull", "--recurse-submodules"])
-                        }
-                        Action::RunRemoveOriginRemote(_) => {
-                            git_args(&["remote", "remove", "origin"])
-                        }
-                        _ => unreachable!(),
+                    let branch = self.branch_action_state(idx).branch;
+                    let display_name = self.action_repo_name(idx);
+                    let (mut git_args, progress, success, should_add_origin_branch) = match action {
+                        Action::GitPull(_) => (
+                            git_args(&["pull"]),
+                            format!("Pulling {display_name}..."),
+                            format!("Pulled {display_name}"),
+                            true,
+                        ),
+                        Action::RunGitPullRebase(_) => (
+                            git_args(&["pull", "--rebase"]),
+                            format!("Rebasing {display_name}..."),
+                            format!("Rebased {display_name}"),
+                            true,
+                        ),
+                        Action::RunGitPullSubmodules(_) => (
+                            git_args(&["pull", "--recurse-submodules"]),
+                            format!("Pulling submodules for {display_name}..."),
+                            format!("Pulled submodules for {display_name}"),
+                            true,
+                        ),
+                        Action::RunRemoveOriginRemote(_) => (
+                            git_args(&["remote", "remove", "origin"]),
+                            format!("Removing origin from {display_name}..."),
+                            format!("Removed origin from {display_name}"),
+                            false,
+                        ),
+                        _ => return Ok(false),
                     };
                     if should_add_origin_branch && !branch.is_empty() && branch != "(no branch)" {
                         git_args.push("origin".into());
                         git_args.push(branch);
                     }
-                    entry.git_op = true;
-                    let display_name =
-                        entry.display_name_for_format(self.config.ui.repo_name_format, false);
-                    let progress = match action {
-                        Action::GitPull(_) => format!("Pulling {display_name}..."),
-                        Action::RunGitPullRebase(_) => format!("Rebasing {display_name}..."),
-                        Action::RunGitPullSubmodules(_) => {
-                            format!("Pulling submodules for {display_name}...")
-                        }
-                        Action::RunRemoveOriginRemote(_) => {
-                            format!("Removing origin from {display_name}...")
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.success_message = Some((progress, Instant::now()));
-                    let path = entry.path.clone();
-                    let repo_id = id.clone();
-                    let success = match action {
-                        Action::GitPull(_) => format!("Pulled {display_name}"),
-                        Action::RunGitPullRebase(_) => format!("Rebased {display_name}"),
-                        Action::RunGitPullSubmodules(_) => {
-                            format!("Pulled submodules for {display_name}")
-                        }
-                        Action::RunRemoveOriginRemote(_) => {
-                            format!("Removed origin from {display_name}")
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.spawn_git_operation(
-                        repo_id,
-                        move || crate::git::run_git_args(&path, &git_args),
-                        move |_| success,
-                        None,
-                    );
+                    self.spawn_git_args_operation(idx, id, git_args, progress, success);
                 }
                 Ok(true)
             }
             Action::GitSubmoduleUpdateLatest(id) => {
-                if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let name = self.repo_list.repos[idx]
-                        .display_name_for_format(self.config.ui.repo_name_format, false);
-                    self.confirm_dialog.show(
-                        format!("Pull latest in all submodules for {name}?"),
-                        Action::RunGitSubmoduleUpdateLatest(id.clone()),
-                    );
-                }
+                self.confirm_repo_action(
+                    id,
+                    |name| format!("Pull latest in all submodules for {name}?"),
+                    Action::RunGitSubmoduleUpdateLatest(id.clone()),
+                );
                 Ok(true)
             }
             Action::GitSubmoduleUpdate(id)
             | Action::GitSubmoduleSync(id)
             | Action::RunGitSubmoduleUpdateLatest(id) => {
                 if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let entry = &mut self.repo_list.repos[idx];
-                    let git_args = match action {
-                        Action::GitSubmoduleUpdate(_) => {
-                            git_args(&["submodule", "update", "--init", "--recursive"])
-                        }
-                        Action::GitSubmoduleSync(_) => git_args(&["submodule", "sync"]),
-                        Action::RunGitSubmoduleUpdateLatest(_) => {
-                            git_args(&["submodule", "foreach", "git", "pull", "origin", "HEAD"])
-                        }
-                        _ => unreachable!(),
+                    let display_name = self.action_repo_name(idx);
+                    let (git_args, progress, success) = match action {
+                        Action::GitSubmoduleUpdate(_) => (
+                            git_args(&["submodule", "update", "--init", "--recursive"]),
+                            format!("Updating submodules for {display_name}..."),
+                            format!("Updated submodules in {display_name}"),
+                        ),
+                        Action::GitSubmoduleSync(_) => (
+                            git_args(&["submodule", "sync"]),
+                            format!("Syncing submodules for {display_name}..."),
+                            format!("Synced submodules in {display_name}"),
+                        ),
+                        Action::RunGitSubmoduleUpdateLatest(_) => (
+                            git_args(&["submodule", "foreach", "git", "pull", "origin", "HEAD"]),
+                            format!("Pulling latest in submodules for {display_name}..."),
+                            format!("Pulled latest in submodules for {display_name}"),
+                        ),
+                        _ => return Ok(false),
                     };
-                    entry.git_op = true;
-                    let display_name =
-                        entry.display_name_for_format(self.config.ui.repo_name_format, false);
-                    let progress = match action {
-                        Action::GitSubmoduleUpdate(_) => {
-                            format!("Updating submodules for {display_name}...")
-                        }
-                        Action::GitSubmoduleSync(_) => {
-                            format!("Syncing submodules for {display_name}...")
-                        }
-                        Action::RunGitSubmoduleUpdateLatest(_) => {
-                            format!("Pulling latest in submodules for {display_name}...")
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.success_message = Some((progress, Instant::now()));
-                    let path = entry.path.clone();
-                    let repo_id = id.clone();
-                    let success = match action {
-                        Action::GitSubmoduleUpdate(_) => {
-                            format!("Updated submodules in {display_name}")
-                        }
-                        Action::GitSubmoduleSync(_) => {
-                            format!("Synced submodules in {display_name}")
-                        }
-                        Action::RunGitSubmoduleUpdateLatest(_) => {
-                            format!("Pulled latest in submodules for {display_name}")
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.spawn_git_operation(
-                        repo_id,
-                        move || crate::git::run_git_args(&path, &git_args),
-                        move |_| success,
-                        None,
-                    );
+                    self.spawn_git_args_operation(idx, id, git_args, progress, success);
                 }
                 Ok(true)
             }

@@ -336,6 +336,18 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn parse_config(toml_str: &str) -> Config {
+        toml::from_str(toml_str).unwrap()
+    }
+
+    fn serialize_config(config: &Config) -> String {
+        toml::to_string_pretty(config).unwrap()
+    }
+
+    fn roundtrip(config: &Config) -> Config {
+        parse_config(&serialize_config(config))
+    }
+
     #[test]
     fn test_default_config_has_code_root() {
         let config = Config::default();
@@ -366,10 +378,10 @@ mod tests {
         config.pinned_repos.push(PathBuf::from("/tmp/test-repo"));
 
         // Write directly to temp path
-        let contents = toml::to_string_pretty(&config).unwrap();
+        let contents = serialize_config(&config);
         std::fs::write(&path, &contents).unwrap();
 
-        let loaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let loaded = parse_config(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(loaded.pinned_repos, vec![PathBuf::from("/tmp/test-repo")]);
     }
 
@@ -382,8 +394,8 @@ mod tests {
         let config = Config::load_or_create_at(&path).unwrap();
 
         assert!(path.exists());
-        let expected = toml::to_string_pretty(&Config::default()).unwrap();
-        assert_eq!(toml::to_string_pretty(&config).unwrap(), expected);
+        let expected = serialize_config(&Config::default());
+        assert_eq!(serialize_config(&config), expected);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     }
 
@@ -397,208 +409,81 @@ mod tests {
     }
 
     #[test]
-    fn test_branch_filter_parse_local() {
-        let toml_str = r#"
-            [graph]
-            branches = "local"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.graph.branches, BranchFilter::Local);
-    }
-
-    #[test]
-    fn test_graph_config_defaults() {
-        let config: Config = toml::from_str("").unwrap();
+    fn test_config_defaults() {
+        let config = parse_config("");
         assert_eq!(config.graph.branches, BranchFilter::All);
         assert_eq!(config.graph.label_max_len, 24);
-    }
-
-    #[test]
-    fn test_graph_config_roundtrip() {
-        let mut config = Config::default();
-        config.graph.branches = BranchFilter::Remote;
-        config.graph.label_max_len = 16;
-
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(loaded.graph.branches, BranchFilter::Remote);
-        assert_eq!(loaded.graph.label_max_len, 16);
-    }
-
-    #[test]
-    fn test_show_stats_defaults_true() {
-        let config: Config = toml::from_str("").unwrap();
         assert!(config.graph.show_stats);
-    }
-
-    #[test]
-    fn test_show_stats_roundtrip() {
-        let mut config = Config::default();
-        config.graph.show_stats = false;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(!loaded.graph.show_stats);
-    }
-
-    #[test]
-    fn test_check_for_updates_defaults_false() {
-        let config: Config = toml::from_str("").unwrap();
         assert!(!config.ui.check_for_updates);
         assert_eq!(config.ui.update_position, UpdatePosition::TopRight);
-    }
-
-    #[test]
-    fn test_update_position_parse() {
-        let toml_str = r#"
-            [ui]
-            check_for_updates = false
-            update_position = "top-left"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(!config.ui.check_for_updates);
-        assert_eq!(config.ui.update_position, UpdatePosition::TopLeft);
-    }
-
-    #[test]
-    fn test_update_config_roundtrip() {
-        let mut config = Config::default();
-        config.ui.check_for_updates = false;
-        config.ui.update_position = UpdatePosition::TopLeft;
-        config.ui.repo_name_format = RepoNameFormat::ParentFolder;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(!loaded.ui.check_for_updates);
-        assert_eq!(loaded.ui.update_position, UpdatePosition::TopLeft);
-        assert_eq!(loaded.ui.repo_name_format, RepoNameFormat::ParentFolder);
-    }
-
-    #[test]
-    fn test_repo_name_format_parse() {
-        let toml_str = r#"
-            [ui]
-            repo_name_format = "path"
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.ui.repo_name_format, RepoNameFormat::Path);
-    }
-
-    #[test]
-    fn test_github_hosts_default() {
-        let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.github.hosts, vec!["github.com"]);
-    }
-
-    #[test]
-    fn test_github_hosts_parse() {
-        let toml_str = r#"
-            [github]
-            hosts = ["github.com", "git.example.com"]
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.github.hosts, vec!["github.com", "git.example.com"]);
-    }
-
-    #[test]
-    fn test_submodule_config_defaults() {
-        let config: Config = toml::from_str("").unwrap();
         assert!(!config.submodules.ignore_dirty);
-    }
-
-    #[test]
-    fn test_submodule_config_roundtrip() {
-        let mut config = Config::default();
-        config.submodules.ignore_dirty = true;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(loaded.submodules.ignore_dirty);
-    }
-
-    #[test]
-    fn test_submodule_config_parse() {
-        let toml_str = r#"
-            [submodules]
-            ignore_dirty = true
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.submodules.ignore_dirty);
-    }
-
-    #[test]
-    fn test_commit_config_defaults() {
-        let config: Config = toml::from_str("").unwrap();
         assert!(!config.commit.no_verify);
-    }
-
-    #[test]
-    fn test_commit_config_roundtrip() {
-        let mut config = Config::default();
-        config.commit.no_verify = true;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
-        assert!(loaded.commit.no_verify);
-    }
-
-    #[test]
-    fn test_commit_config_parse() {
-        let toml_str = r#"
-            [commit]
-            no_verify = true
-        "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.commit.no_verify);
-    }
-
-    #[test]
-    fn test_max_concurrent_polls_default() {
-        let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.watch.max_concurrent_polls, 4);
-    }
-
-    #[test]
-    fn test_poll_local_full_every_default() {
-        let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.watch.poll_local_full_every, 12);
     }
 
     #[test]
-    fn test_status_untracked_parse() {
+    fn test_config_parses_non_default_sections() {
         let toml_str = r#"
+            [graph]
+            branches = "local"
+
+            [ui]
+            check_for_updates = false
+            update_position = "top-left"
+            repo_name_format = "path"
+
+            [github]
+            hosts = ["github.com", "git.example.com"]
+
+            [submodules]
+            ignore_dirty = true
+
+            [commit]
+            no_verify = true
+
             [status]
             untracked = "normal"
         "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
+        let config = parse_config(toml_str);
+        assert_eq!(config.graph.branches, BranchFilter::Local);
+        assert_eq!(config.ui.update_position, UpdatePosition::TopLeft);
+        assert_eq!(config.ui.repo_name_format, RepoNameFormat::Path);
+        assert_eq!(config.github.hosts, vec!["github.com", "git.example.com"]);
+        assert!(config.submodules.ignore_dirty);
+        assert!(config.commit.no_verify);
         assert_eq!(config.status.untracked, UntrackedMode::Normal);
     }
 
     #[test]
-    fn test_status_untracked_roundtrip() {
+    fn test_config_roundtrip_preserves_non_defaults() {
         let mut config = Config::default();
+        config.graph.branches = BranchFilter::Remote;
+        config.graph.label_max_len = 16;
+        config.graph.show_stats = false;
+        config.ui.update_position = UpdatePosition::TopLeft;
+        config.ui.repo_name_format = RepoNameFormat::ParentFolder;
+        config.submodules.ignore_dirty = true;
+        config.commit.no_verify = true;
         config.status.untracked = UntrackedMode::None;
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let loaded: Config = toml::from_str(&serialized).unwrap();
+
+        let loaded = roundtrip(&config);
+        assert_eq!(loaded.graph.branches, BranchFilter::Remote);
+        assert_eq!(loaded.graph.label_max_len, 16);
+        assert!(!loaded.graph.show_stats);
+        assert_eq!(loaded.ui.update_position, UpdatePosition::TopLeft);
+        assert_eq!(loaded.ui.repo_name_format, RepoNameFormat::ParentFolder);
+        assert!(loaded.submodules.ignore_dirty);
+        assert!(loaded.commit.no_verify);
         assert_eq!(loaded.status.untracked, UntrackedMode::None);
     }
 
     #[test]
     fn test_watch_exclude_dirs_default() {
-        let config: Config = toml::from_str("").unwrap();
-        assert!(
-            config
-                .watch
-                .watch_exclude_dirs
-                .contains(&"node_modules".to_string())
-        );
-        assert!(
-            config
-                .watch
-                .watch_exclude_dirs
-                .contains(&"target".to_string())
-        );
-        assert!(
-            config
-                .watch
-                .watch_exclude_dirs
-                .contains(&".next".to_string())
-        );
+        let config = parse_config("");
+        for dir in ["node_modules", "target", ".next"] {
+            assert!(config.watch.watch_exclude_dirs.contains(&dir.to_string()));
+        }
     }
 }

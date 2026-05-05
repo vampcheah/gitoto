@@ -15,10 +15,7 @@ pub(crate) fn list_commit_files(
 
     let message = commit.message().unwrap_or("").trim().to_string();
 
-    let tree = commit.tree()?;
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let diff = diff_for_commit(&repo, &commit, None)?;
 
     let mut files = Vec::new();
     for delta in diff.deltas() {
@@ -60,13 +57,10 @@ pub(crate) fn commit_file_diff(
     let oid = Oid::from_str(oid_str)?;
     let commit = repo.find_commit(oid)?;
 
-    let tree = commit.tree()?;
-    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-
     let mut opts = DiffOptions::new();
     opts.pathspec(file_path);
 
-    let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))?;
+    let diff = diff_for_commit(&repo, &commit, Some(&mut opts))?;
 
     let mut output = String::new();
     diff_to_string(&diff, &mut output)?;
@@ -101,11 +95,7 @@ pub(crate) fn batch_diff_stats(
         let Ok(commit) = repo.find_commit(oid) else {
             continue;
         };
-        let Ok(tree) = commit.tree() else {
-            continue;
-        };
-        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
-        let Ok(diff) = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None) else {
+        let Ok(diff) = diff_for_commit(&repo, &commit, None) else {
             continue;
         };
         let Ok(stats) = diff.stats() else {
@@ -130,6 +120,16 @@ pub(crate) fn batch_diff_stats(
     Ok(results)
 }
 
+fn diff_for_commit<'repo>(
+    repo: &'repo Repository,
+    commit: &git2::Commit<'repo>,
+    opts: Option<&mut DiffOptions>,
+) -> color_eyre::Result<Diff<'repo>> {
+    let tree = commit.tree()?;
+    let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    Ok(repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), opts)?)
+}
+
 fn diff_to_string(diff: &Diff<'_>, output: &mut String) -> color_eyre::Result<()> {
     diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
         let prefix = match line.origin() {
@@ -148,25 +148,14 @@ fn diff_to_string(diff: &Diff<'_>, output: &mut String) -> color_eyre::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{Repository, Signature};
-    use std::fs;
+    use crate::git::test_support;
+    use git2::Repository;
     use tempfile::TempDir;
 
     fn create_repo_with_file(file_name: &str, content: &str) -> (TempDir, Repository, String) {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-
-        fs::write(tmp.path().join(file_name), content).unwrap();
-        let oid = {
-            let mut index = repo.index().unwrap();
-            index.add_path(Path::new(file_name)).unwrap();
-            index.write().unwrap();
-            let tree_id = index.write_tree().unwrap();
-            let tree = repo.find_tree(tree_id).unwrap();
-            let sig = Signature::now("Test", "test@test.com").unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "Add file", &tree, &[])
-                .unwrap()
-        };
+        let (tmp, repo) = test_support::init_repo();
+        let oid =
+            test_support::write_commit(&repo, tmp.path(), file_name, content, "Add file", &[]);
 
         (tmp, repo, oid.to_string())
     }
@@ -176,19 +165,17 @@ mod tests {
         let (tmp, repo, first_oid) = create_repo_with_file("hello.txt", "hello");
 
         // Second commit with a modification
-        fs::write(tmp.path().join("hello.txt"), "world").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("hello.txt")).unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = Signature::now("Test", "test@test.com").unwrap();
         let parent = repo
             .find_commit(git2::Oid::from_str(&first_oid).unwrap())
             .unwrap();
-        let oid2 = repo
-            .commit(Some("HEAD"), &sig, &sig, "Modify file", &tree, &[&parent])
-            .unwrap();
+        let oid2 = test_support::write_commit(
+            &repo,
+            tmp.path(),
+            "hello.txt",
+            "world",
+            "Modify file",
+            &[&parent],
+        );
 
         let (message, files) = list_commit_files(tmp.path(), &oid2.to_string()).unwrap();
         assert_eq!(message, "Modify file");
@@ -213,19 +200,17 @@ mod tests {
         let (tmp, repo, first_oid) = create_repo_with_file("file.txt", "line1\n");
 
         // Second commit adds lines
-        fs::write(tmp.path().join("file.txt"), "line1\nline2\nline3\n").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("file.txt")).unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        let sig = Signature::now("Test", "test@test.com").unwrap();
         let parent = repo
             .find_commit(Oid::from_str(&first_oid).unwrap())
             .unwrap();
-        let oid2 = repo
-            .commit(Some("HEAD"), &sig, &sig, "Add lines", &tree, &[&parent])
-            .unwrap();
+        let oid2 = test_support::write_commit(
+            &repo,
+            tmp.path(),
+            "file.txt",
+            "line1\nline2\nline3\n",
+            "Add lines",
+            &[&parent],
+        );
 
         let stats = batch_diff_stats(tmp.path(), &[oid2]).unwrap();
         assert_eq!(stats.len(), 1);

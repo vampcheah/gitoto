@@ -43,9 +43,7 @@ pub(crate) struct DiffStat {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct GraphRow {
-    pub commit_col: usize,
     pub lanes: Vec<LaneSegment>,
     pub oid: Oid,
     pub short_id: String,
@@ -118,7 +116,7 @@ impl GraphBuilder {
             let parent_oids: Vec<Oid> = commit.parent_ids().collect();
             let is_merge = commit.parent_count() > 1;
             let labels = ref_map.remove(&oid).unwrap_or_default();
-            let (commit_col, lanes, horizontal_spans) = self.process_commit(oid, &parent_oids);
+            let (_, lanes, horizontal_spans) = self.process_commit(oid, &parent_oids);
 
             let short_id = oid.to_string()[..7].to_string();
             let message = commit.summary().unwrap_or("").to_string();
@@ -126,7 +124,6 @@ impl GraphBuilder {
             let time = commit.time().seconds();
 
             rows.push(GraphRow {
-                commit_col,
                 lanes,
                 oid,
                 short_id,
@@ -452,7 +449,7 @@ fn resolve_refs(repo: &Repository, filter: &BranchFilter) -> HashMap<Oid, Vec<Br
         BranchFilter::All => vec![BranchType::Local, BranchType::Remote],
         BranchFilter::Local => vec![BranchType::Local],
         BranchFilter::Remote => vec![BranchType::Remote],
-        BranchFilter::None => unreachable!(),
+        BranchFilter::None => Vec::new(),
     };
 
     for bt in branch_types {
@@ -495,12 +492,7 @@ fn resolve_refs(repo: &Repository, filter: &BranchFilter) -> HashMap<Oid, Vec<Br
             let Ok(reference) = repo.find_reference(&refname) else {
                 continue;
             };
-            let oid = reference
-                .peel_to_commit()
-                .ok()
-                .map(|c| c.id())
-                .or_else(|| reference.target());
-            if let Some(oid) = oid {
+            if let Some(oid) = crate::git::reference_oid(&reference) {
                 map.entry(oid).or_default().push(BranchLabel {
                     name: name.to_string(),
                     is_head: false,
@@ -527,31 +519,13 @@ fn resolve_refs(repo: &Repository, filter: &BranchFilter) -> HashMap<Oid, Vec<Br
 }
 
 fn collect_worktree_branches(repo: &Repository) -> HashSet<String> {
-    let mut branches = HashSet::new();
-    let wt_names = match repo.worktrees() {
-        Ok(names) => names,
-        Err(_) => return branches,
-    };
-    for i in 0..wt_names.len() {
-        let name = match wt_names.get(i) {
-            Some(n) => n,
-            None => continue,
-        };
-        let wt = match repo.find_worktree(name) {
-            Ok(wt) => wt,
-            Err(_) => continue,
-        };
-        let wt_repo = match Repository::open(wt.path()) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        if let Ok(head) = wt_repo.head()
-            && let Some(shorthand) = head.shorthand()
-        {
-            branches.insert(shorthand.to_string());
-        }
-    }
-    branches
+    crate::git::linked_worktrees(repo)
+        .into_iter()
+        .filter_map(|(_, path)| {
+            let wt_repo = Repository::open(path).ok()?;
+            Some(crate::git::current_branch_name(&wt_repo, "HEAD"))
+        })
+        .collect()
 }
 
 /// Assign a color index (0..PALETTE_SIZE) for a given lane column.
@@ -563,21 +537,41 @@ pub(crate) fn lane_color(col: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git2::{Repository, Signature};
-    use tempfile::TempDir;
+    use crate::git::test_support;
+    use crate::git::test_support::oid;
 
-    fn create_commit(repo: &Repository, message: &str, parents: &[&git2::Commit]) -> Oid {
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, message, &tree, parents)
-            .unwrap()
+    fn create_commit(repo: &git2::Repository, message: &str, parents: &[&git2::Commit]) -> Oid {
+        test_support::commit(repo, message, parents)
+    }
+
+    fn merge_history_rows(options: &GraphOptions) -> Vec<GraphRow> {
+        let (tmp, repo) = test_support::init_repo();
+        let oid1 = create_commit(&repo, "root", &[]);
+        let c1 = repo.find_commit(oid1).unwrap();
+        let oid2 = test_support::commit_detached(&repo, "branch-a", &[&c1]);
+        let c2 = repo.find_commit(oid2).unwrap();
+        let oid3 = test_support::commit_detached(&repo, "branch-b", &[&c1]);
+        let c3 = repo.find_commit(oid3).unwrap();
+        let merge_oid = test_support::commit_detached(&repo, "merge", &[&c2, &c3]);
+        repo.set_head_detached(merge_oid).unwrap();
+        GraphBuilder::new().build(tmp.path(), options).unwrap()
+    }
+
+    fn assert_lane_result(
+        result: (usize, Vec<LaneSegment>, Vec<(usize, usize, usize)>),
+        expected_col: usize,
+        expected_lanes: &[LaneSegment],
+        expected_spans: &[(usize, usize, usize)],
+    ) {
+        let (col, lanes, spans) = result;
+        assert_eq!(col, expected_col);
+        assert_eq!(lanes, expected_lanes);
+        assert_eq!(spans, expected_spans);
     }
 
     #[test]
     fn test_linear_history_single_lane() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let oid1 = create_commit(&repo, "first", &[]);
         let c1 = repo.find_commit(oid1).unwrap();
@@ -587,43 +581,12 @@ mod tests {
         let rows = builder.build(tmp.path(), &GraphOptions::default()).unwrap();
 
         assert_eq!(rows.len(), 2);
-        // All commits should be in column 0
-        for row in &rows {
-            assert_eq!(row.commit_col, 0);
-        }
+        assert!(rows.iter().all(|row| row.lanes[0] == LaneSegment::Commit));
     }
 
     #[test]
     fn test_merge_creates_two_lanes() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-
-        let oid1 = create_commit(&repo, "root", &[]);
-        let c1 = repo.find_commit(oid1).unwrap();
-
-        // Create two divergent commits
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        let oid2 = repo
-            .commit(None, &sig, &sig, "branch-a", &tree, &[&c1])
-            .unwrap();
-        let c2 = repo.find_commit(oid2).unwrap();
-
-        let oid3 = repo
-            .commit(None, &sig, &sig, "branch-b", &tree, &[&c1])
-            .unwrap();
-        let c3 = repo.find_commit(oid3).unwrap();
-
-        // Merge: first parent is c2
-        let merge_oid = repo
-            .commit(None, &sig, &sig, "merge", &tree, &[&c2, &c3])
-            .unwrap();
-        repo.set_head_detached(merge_oid).unwrap();
-
-        let builder = GraphBuilder::new();
-        let rows = builder.build(tmp.path(), &GraphOptions::default()).unwrap();
+        let rows = merge_history_rows(&GraphOptions::default());
 
         assert!(rows.len() >= 3);
         let merge_row = &rows[0];
@@ -632,8 +595,7 @@ mod tests {
 
     #[test]
     fn test_root_commit_closes_lane() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let _oid1 = create_commit(&repo, "only", &[]);
 
@@ -641,39 +603,12 @@ mod tests {
         let rows = builder.build(tmp.path(), &GraphOptions::default()).unwrap();
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].commit_col, 0);
         assert_eq!(rows[0].lanes[0], LaneSegment::Commit);
     }
 
     #[test]
     fn test_multiple_branches_assign_different_columns() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-
-        let oid1 = create_commit(&repo, "root", &[]);
-        let c1 = repo.find_commit(oid1).unwrap();
-
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        let oid2 = repo
-            .commit(None, &sig, &sig, "left", &tree, &[&c1])
-            .unwrap();
-        let c2 = repo.find_commit(oid2).unwrap();
-
-        let oid3 = repo
-            .commit(None, &sig, &sig, "right", &tree, &[&c1])
-            .unwrap();
-        let c3 = repo.find_commit(oid3).unwrap();
-
-        let merge_oid = repo
-            .commit(None, &sig, &sig, "merge", &tree, &[&c2, &c3])
-            .unwrap();
-        repo.set_head_detached(merge_oid).unwrap();
-
-        let builder = GraphBuilder::new();
-        let rows = builder.build(tmp.path(), &GraphOptions::default()).unwrap();
+        let rows = merge_history_rows(&GraphOptions::default());
 
         // After merge, we should see a fork to a second column
         let merge_row = &rows[0];
@@ -686,8 +621,7 @@ mod tests {
 
     #[test]
     fn test_graph_rows_carry_labels() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let oid1 = create_commit(&repo, "first", &[]);
         let c1 = repo.find_commit(oid1).unwrap();
@@ -706,8 +640,7 @@ mod tests {
 
     #[test]
     fn test_head_marked() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let _oid1 = create_commit(&repo, "init", &[]);
 
@@ -720,33 +653,7 @@ mod tests {
 
     #[test]
     fn test_merge_is_merge_true() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-
-        let oid1 = create_commit(&repo, "root", &[]);
-        let c1 = repo.find_commit(oid1).unwrap();
-
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        let oid2 = repo
-            .commit(None, &sig, &sig, "branch-a", &tree, &[&c1])
-            .unwrap();
-        let c2 = repo.find_commit(oid2).unwrap();
-
-        let oid3 = repo
-            .commit(None, &sig, &sig, "branch-b", &tree, &[&c1])
-            .unwrap();
-        let c3 = repo.find_commit(oid3).unwrap();
-
-        let merge_oid = repo
-            .commit(None, &sig, &sig, "merge", &tree, &[&c2, &c3])
-            .unwrap();
-        repo.set_head_detached(merge_oid).unwrap();
-
-        let builder = GraphBuilder::new();
-        let rows = builder.build(tmp.path(), &GraphOptions::default()).unwrap();
+        let rows = merge_history_rows(&GraphOptions::default());
 
         assert!(rows[0].is_merge, "first row should be a merge commit");
         assert!(
@@ -758,116 +665,96 @@ mod tests {
     #[test]
     fn test_merge_left_horizontal_fill() {
         let mut builder = GraphBuilder::new();
-        let oid_target = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_b = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        let oid_c = Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
-        let oid_commit = Oid::from_str("dddddddddddddddddddddddddddddddddddddd").unwrap();
+        let oid_target = oid('a');
+        let oid_b = oid('b');
+        let oid_c = oid('c');
+        let oid_commit = oid('d');
 
         builder.active_lanes = vec![Some(oid_target), Some(oid_b), Some(oid_c), Some(oid_commit)];
 
-        let (col, lanes, spans) = builder.process_commit(oid_commit, &[oid_target]);
-
-        assert_eq!(col, 3);
-        assert_eq!(lanes[0], LaneSegment::RightTee);
-        assert_eq!(lanes[1], LaneSegment::CrossHorizontal);
-        assert_eq!(lanes[2], LaneSegment::CrossHorizontal);
-        assert_eq!(lanes[3], LaneSegment::MergeLeft);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0], (0, 3, lane_color(3)));
+        assert_lane_result(
+            builder.process_commit(oid_commit, &[oid_target]),
+            3,
+            &[
+                LaneSegment::RightTee,
+                LaneSegment::CrossHorizontal,
+                LaneSegment::CrossHorizontal,
+                LaneSegment::MergeLeft,
+            ],
+            &[(0, 3, lane_color(3))],
+        );
     }
 
     #[test]
     fn test_fork_right_horizontal_fill() {
         let mut builder = GraphBuilder::new();
-        let oid_commit = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_active = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        let oid_parent1 = Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
-        let oid_parent2 = Oid::from_str("dddddddddddddddddddddddddddddddddddddd").unwrap();
+        let oid_commit = oid('a');
+        let oid_active = oid('b');
+        let oid_parent1 = oid('c');
+        let oid_parent2 = oid('d');
 
         builder.active_lanes = vec![Some(oid_commit), Some(oid_active), None];
 
-        let (col, lanes, spans) = builder.process_commit(oid_commit, &[oid_parent1, oid_parent2]);
-
-        assert_eq!(col, 0);
-        assert_eq!(lanes[0], LaneSegment::Commit);
-        assert_eq!(lanes[1], LaneSegment::CrossHorizontal);
-        assert_eq!(lanes[2], LaneSegment::ForkRight);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0], (0, 2, lane_color(2)));
+        assert_lane_result(
+            builder.process_commit(oid_commit, &[oid_parent1, oid_parent2]),
+            0,
+            &[
+                LaneSegment::Commit,
+                LaneSegment::CrossHorizontal,
+                LaneSegment::ForkRight,
+            ],
+            &[(0, 2, lane_color(2))],
+        );
     }
 
     #[test]
     fn test_adjacent_merge_no_intermediate() {
         let mut builder = GraphBuilder::new();
-        let oid_target = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_commit = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+        let oid_target = oid('a');
+        let oid_commit = oid('b');
 
         builder.active_lanes = vec![Some(oid_target), Some(oid_commit)];
 
-        let (col, lanes, spans) = builder.process_commit(oid_commit, &[oid_target]);
-
-        assert_eq!(col, 1);
-        assert_eq!(lanes[0], LaneSegment::RightTee);
-        assert_eq!(lanes[1], LaneSegment::MergeLeft);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0], (0, 1, lane_color(1)));
+        assert_lane_result(
+            builder.process_commit(oid_commit, &[oid_target]),
+            1,
+            &[LaneSegment::RightTee, LaneSegment::MergeLeft],
+            &[(0, 1, lane_color(1))],
+        );
     }
 
     #[test]
     fn test_merge_right_horizontal_fill() {
         let mut builder = GraphBuilder::new();
-        let oid_commit = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_b = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        let oid_target = Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
+        let oid_commit = oid('a');
+        let oid_b = oid('b');
+        let oid_target = oid('c');
 
         // Commit at col 0, first parent already in col 2 → MergeRight
         builder.active_lanes = vec![Some(oid_commit), Some(oid_b), Some(oid_target)];
 
-        let (col, lanes, spans) = builder.process_commit(oid_commit, &[oid_target]);
-
-        assert_eq!(col, 0);
-        assert_eq!(lanes[0], LaneSegment::MergeRight);
-        assert_eq!(lanes[1], LaneSegment::CrossHorizontal);
-        assert_eq!(lanes[2], LaneSegment::LeftTee);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0], (0, 2, lane_color(0)));
+        assert_lane_result(
+            builder.process_commit(oid_commit, &[oid_target]),
+            0,
+            &[
+                LaneSegment::MergeRight,
+                LaneSegment::CrossHorizontal,
+                LaneSegment::LeftTee,
+            ],
+            &[(0, 2, lane_color(0))],
+        );
     }
 
     #[test]
     fn test_first_parent_simplifies_graph() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
-
-        let oid1 = create_commit(&repo, "root", &[]);
-        let c1 = repo.find_commit(oid1).unwrap();
-
-        let sig = Signature::now("Test", "test@test.com").unwrap();
-        let tree_id = repo.index().unwrap().write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
-
-        let oid2 = repo
-            .commit(None, &sig, &sig, "branch-a", &tree, &[&c1])
-            .unwrap();
-        let c2 = repo.find_commit(oid2).unwrap();
-
-        let oid3 = repo
-            .commit(None, &sig, &sig, "branch-b", &tree, &[&c1])
-            .unwrap();
-        let c3 = repo.find_commit(oid3).unwrap();
-
-        let merge_oid = repo
-            .commit(None, &sig, &sig, "merge", &tree, &[&c2, &c3])
-            .unwrap();
-        repo.set_head_detached(merge_oid).unwrap();
-
         let all_opts = GraphOptions::default();
-        let rows_all = GraphBuilder::new().build(tmp.path(), &all_opts).unwrap();
+        let rows_all = merge_history_rows(&all_opts);
 
         let fp_opts = GraphOptions {
             first_parent: true,
             ..Default::default()
         };
-        let rows_fp = GraphBuilder::new().build(tmp.path(), &fp_opts).unwrap();
+        let rows_fp = merge_history_rows(&fp_opts);
 
         // First-parent should have fewer rows (skips branch-b)
         assert!(
@@ -880,8 +767,7 @@ mod tests {
 
     #[test]
     fn test_tag_labels_appear_on_tagged_commit() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let oid = create_commit(&repo, "tagged commit", &[]);
 
@@ -900,8 +786,7 @@ mod tests {
 
     #[test]
     fn test_tags_sort_after_branches() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let oid = create_commit(&repo, "init", &[]);
 
@@ -924,8 +809,7 @@ mod tests {
 
     #[test]
     fn test_filter_none_yields_no_labels() {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+        let (tmp, repo) = test_support::init_repo();
 
         let _oid1 = create_commit(&repo, "init", &[]);
 
@@ -946,43 +830,21 @@ mod tests {
 
     // --- compute_branch_segments tests ---
 
-    fn mock_segment_row(oid_str: &str, short_id: &str, parent_oids: Vec<Oid>) -> GraphRow {
-        GraphRow {
-            commit_col: 0,
-            lanes: vec![LaneSegment::Commit],
-            horizontal_spans: Vec::new(),
-            oid: Oid::from_str(oid_str).unwrap(),
-            short_id: short_id.to_string(),
-            message: String::new(),
-            author: String::new(),
-            time: 0,
-            labels: Vec::new(),
-            is_pushed: false,
-            is_merge: false,
-            parent_oids,
-            diff_stat: None,
-            collapsed: None,
-        }
+    fn segment_row(ch: char, short_id: &str, parents: &[char]) -> GraphRow {
+        test_support::graph_row(
+            &test_support::oid_id(ch),
+            short_id,
+            parents.iter().map(|&ch| oid(ch)).collect(),
+        )
     }
 
     #[test]
     fn test_segments_linear_history_no_segments() {
         // A -> B -> C (linear, all main trunk)
-        let oid_b = Oid::from_str("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-        let oid_c = Oid::from_str("cccccccccccccccccccccccccccccccccccccccc").unwrap();
-
         let rows = vec![
-            mock_segment_row(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "aaa",
-                vec![oid_b],
-            ),
-            mock_segment_row(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "bbb",
-                vec![oid_c],
-            ),
-            mock_segment_row("cccccccccccccccccccccccccccccccccccccccc", "ccc", vec![]),
+            segment_row('a', "aaa", &['b']),
+            segment_row('b', "bbb", &['c']),
+            segment_row('c', "ccc", &[]),
         ];
 
         let segments = compute_branch_segments(&rows);
@@ -994,64 +856,27 @@ mod tests {
 
     #[test]
     fn test_segments_simple_branch_and_merge() {
-        let oid_a = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_e = Oid::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
-        let oid_f = Oid::from_str("ffffffffffffffffffffffffffffffffffffffff").unwrap();
-
         let rows = vec![
-            mock_segment_row(
-                "1111111111111111111111111111111111111111",
-                "merge",
-                vec![oid_a, oid_e],
-            ),
-            mock_segment_row(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "aaa",
-                vec![oid_f],
-            ),
-            mock_segment_row(
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                "eee",
-                vec![oid_f],
-            ),
-            mock_segment_row("ffffffffffffffffffffffffffffffffffffffff", "fff", vec![]),
+            segment_row('1', "merge", &['a', 'e']),
+            segment_row('a', "aaa", &['f']),
+            segment_row('e', "eee", &['f']),
+            segment_row('f', "fff", &[]),
         ];
 
         let segments = compute_branch_segments(&rows);
         assert_eq!(segments.len(), 1, "one side branch expected");
         assert_eq!(segments[0].row_indices, vec![2]);
-        assert_eq!(segments[0].id, oid_e.to_string());
+        assert_eq!(segments[0].id, oid('e').to_string());
     }
 
     #[test]
     fn test_segments_two_independent_branches() {
-        let oid_a = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_d = Oid::from_str("dddddddddddddddddddddddddddddddddddddddd").unwrap();
-        let oid_e = Oid::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
-        let oid_f = Oid::from_str("ffffffffffffffffffffffffffffffffffffffff").unwrap();
-
         let rows = vec![
-            mock_segment_row(
-                "1111111111111111111111111111111111111111",
-                "merge",
-                vec![oid_a, oid_d, oid_e],
-            ),
-            mock_segment_row(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "aaa",
-                vec![oid_f],
-            ),
-            mock_segment_row(
-                "dddddddddddddddddddddddddddddddddddddddd",
-                "ddd",
-                vec![oid_f],
-            ),
-            mock_segment_row(
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                "eee",
-                vec![oid_f],
-            ),
-            mock_segment_row("ffffffffffffffffffffffffffffffffffffffff", "fff", vec![]),
+            segment_row('1', "merge", &['a', 'd', 'e']),
+            segment_row('a', "aaa", &['f']),
+            segment_row('d', "ddd", &['f']),
+            segment_row('e', "eee", &['f']),
+            segment_row('f', "fff", &[]),
         ];
 
         let segments = compute_branch_segments(&rows);
@@ -1062,38 +887,17 @@ mod tests {
 
     #[test]
     fn test_segments_multi_commit_branch() {
-        let oid_a = Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
-        let oid_d = Oid::from_str("dddddddddddddddddddddddddddddddddddddddd").unwrap();
-        let oid_e = Oid::from_str("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
-        let oid_f = Oid::from_str("ffffffffffffffffffffffffffffffffffffffff").unwrap();
-
         let rows = vec![
-            mock_segment_row(
-                "1111111111111111111111111111111111111111",
-                "merge",
-                vec![oid_a, oid_d],
-            ),
-            mock_segment_row(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                "aaa",
-                vec![oid_f],
-            ),
-            mock_segment_row(
-                "dddddddddddddddddddddddddddddddddddddddd",
-                "tip",
-                vec![oid_e],
-            ),
-            mock_segment_row(
-                "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                "mid",
-                vec![oid_f],
-            ),
-            mock_segment_row("ffffffffffffffffffffffffffffffffffffffff", "fff", vec![]),
+            segment_row('1', "merge", &['a', 'd']),
+            segment_row('a', "aaa", &['f']),
+            segment_row('d', "tip", &['e']),
+            segment_row('e', "mid", &['f']),
+            segment_row('f', "fff", &[]),
         ];
 
         let segments = compute_branch_segments(&rows);
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].row_indices, vec![2, 3]);
-        assert_eq!(segments[0].id, oid_d.to_string());
+        assert_eq!(segments[0].id, oid('d').to_string());
     }
 }

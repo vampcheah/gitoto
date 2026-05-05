@@ -1,5 +1,5 @@
 use color_eyre::Result;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use crate::action::Action;
 use crate::components::Component;
 use crate::components::commit_input::CommitInput;
 use crate::components::confirm_dialog::ConfirmDialog;
-use crate::components::context_menu::{ContextMenu, RepoMenuState};
+use crate::components::context_menu::ContextMenu;
 use crate::components::file_list::FileList;
 use crate::components::git_graph::GitGraph;
 use crate::components::github_repo_input::GitHubRepoInput;
@@ -28,17 +28,17 @@ use crate::tui::Tui;
 use crate::watcher::RepoWatcher;
 
 mod actions;
+mod diff;
 mod git_ops;
 mod helpers;
 mod input;
+mod messages;
 mod perf;
 mod repo_actions;
+mod status;
 mod ui;
 
-use helpers::{
-    ActiveWorktree, StatusFailure, StatusGuard, StatusQuery, base64_encode,
-    is_valid_github_repo_name, open_browser_url,
-};
+use helpers::{ActiveWorktree, copy_to_clipboard, is_valid_github_repo_name, open_browser_url};
 
 const HELP_PAGE_COUNT: usize = 5;
 
@@ -197,68 +197,62 @@ impl App {
 
     /// Auto-load graph + file list for the selected repo.
     fn sync_selection(&mut self) {
-        if let Some(idx) = self.repo_list.selected_index()
-            && let Some(entry) = self.repo_list.repos.get(idx)
-        {
-            let name = self.repo_display_name(idx);
-            let repo_id = RepoId(entry.path.clone());
-            let files = entry
-                .status
-                .as_ref()
-                .map(|s| s.files.clone())
-                .unwrap_or_default();
-            if let Some(status) = &entry.status {
-                self.graph_keys
-                    .insert(entry.path.clone(), status.graph_key.clone());
-                self.remote_keys
-                    .insert(entry.path.clone(), status.remote_key.clone());
-            }
-            self.file_list.set_files(files, &name, repo_id);
-
-            let path = entry.path.clone();
-            self.git_graph.load_repo(path, &name);
+        if let Some(idx) = self.repo_list.selected_index() {
+            let repo_id = self.repo_list.repos[idx].id();
+            self.load_repo_panels(idx, repo_id);
         }
     }
 
-    fn open_repo_graph(&mut self, id: &RepoId) {
+    fn load_repo_panels(&mut self, idx: usize, repo_id: RepoId) {
+        let entry = &self.repo_list.repos[idx];
+        let name = self.repo_display_name(idx);
+        let path = entry.path.clone();
+        let files = entry
+            .status
+            .as_ref()
+            .map(|s| s.files.clone())
+            .unwrap_or_default();
+        if let Some(status) = &entry.status {
+            self.graph_keys
+                .insert(path.clone(), status.graph_key.clone());
+            self.remote_keys
+                .insert(path.clone(), status.remote_key.clone());
+        }
+        self.file_list.set_files(files, &name, repo_id);
+        self.git_graph.load_repo(path, &name);
+    }
+
+    fn select_repo(&mut self, id: &RepoId) {
         self.context_menu.hide();
         self.active_worktree = None;
         if let Some(idx) = self.repo_list.resolve_index(id) {
             self.repo_list.select_repo_row(idx);
-            let entry = &self.repo_list.repos[idx];
-            let name = self.repo_display_name(idx);
-            let path = entry.path.clone();
-            let files = entry
-                .status
-                .as_ref()
-                .map(|s| s.files.clone())
-                .unwrap_or_default();
-            if let Some(status) = &entry.status {
-                self.graph_keys
-                    .insert(path.clone(), status.graph_key.clone());
-                self.remote_keys
-                    .insert(path.clone(), status.remote_key.clone());
-            }
-            self.file_list.set_files(files, &name, id.clone());
-            self.git_graph.load_repo(path, &name);
+            self.load_repo_panels(idx, id.clone());
+        }
+    }
+
+    fn open_repo_graph(&mut self, id: &RepoId) {
+        self.select_repo(id);
+        if self.repo_list.resolve_index(id).is_some() {
             self.focused_repo = Some(id.clone());
             self.focus = FocusPanel::Graph;
         }
     }
 
+    fn selected_repo_id(&self) -> Option<RepoId> {
+        self.repo_list.selected_repo().map(|entry| entry.id())
+    }
+
     fn active_repo_id(&self) -> Option<RepoId> {
-        self.focused_repo.clone().or_else(|| {
-            self.repo_list
-                .selected_index()
-                .map(|idx| RepoId(self.repo_list.repos[idx].path.clone()))
-        })
+        self.focused_repo
+            .clone()
+            .or_else(|| self.selected_repo_id())
     }
 
     fn focused_repo_name(&self) -> Option<String> {
         self.focused_repo
             .as_ref()
-            .and_then(|id| self.repo_list.resolve_index(id))
-            .map(|idx| self.repo_display_name(idx))
+            .and_then(|id| self.repo_list.display_name_for_id(id))
     }
 
     pub(super) fn repo_display_name(&self, idx: usize) -> String {
@@ -272,102 +266,6 @@ impl App {
             self.operation_log.pop_front();
         }
         self.operation_log.push_back(message.into());
-    }
-
-    fn spawn_status_query(
-        &self,
-        repo_id: RepoId,
-        path: PathBuf,
-        query: StatusQuery,
-        failure: StatusFailure,
-    ) {
-        let tx = self.action_tx.clone();
-        let sem = self.poll_semaphore.clone();
-        let ignore_dirty_subs = self.config.submodules.ignore_dirty;
-        let untracked = self.effective_untracked_mode();
-        let github_hosts = self.config.github.hosts.clone();
-
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            let guard = StatusGuard::new(repo_id.clone(), tx.clone());
-            tokio::task::spawn_blocking(move || {
-                let result = match query {
-                    StatusQuery::Local => {
-                        crate::git::status::query_status_with_untracked_and_github_hosts(
-                            &path,
-                            ignore_dirty_subs,
-                            untracked,
-                            &github_hosts,
-                        )
-                    }
-                    StatusQuery::Fetch => {
-                        crate::git::status::query_status_with_fetch_untracked_and_github_hosts(
-                            &path,
-                            ignore_dirty_subs,
-                            untracked,
-                            &github_hosts,
-                        )
-                    }
-                };
-
-                match result {
-                    Ok(status) => {
-                        let _ = tx.send(Action::RepoStatusUpdated {
-                            id: repo_id,
-                            status,
-                        });
-                        guard.complete();
-                    }
-                    Err(e) => {
-                        guard.complete();
-                        let _ = tx.send(Action::StatusQueryDone(repo_id));
-                        match failure {
-                            StatusFailure::UserVisible => {
-                                let _ = tx.send(Action::Error(format!("Failed to query: {}", e)));
-                            }
-                            StatusFailure::Debug(prefix) => {
-                                tracing::debug!("{} for {}: {}", prefix, path.display(), e);
-                            }
-                        }
-                    }
-                }
-            })
-            .await
-        });
-    }
-
-    fn spawn_worktree_status_query(&self, worktree: ActiveWorktree) {
-        let tx = self.action_tx.clone();
-        let sem = self.poll_semaphore.clone();
-        let ignore_dirty_subs = self.config.submodules.ignore_dirty;
-        let untracked = self.effective_untracked_mode();
-        let github_hosts = self.config.github.hosts.clone();
-
-        tokio::spawn(async move {
-            let _permit = sem.acquire().await;
-            tokio::task::spawn_blocking(move || {
-                match crate::git::status::query_status_with_untracked_and_github_hosts(
-                    &worktree.path,
-                    ignore_dirty_subs,
-                    untracked,
-                    &github_hosts,
-                ) {
-                    Ok(status) => {
-                        let _ = tx.send(Action::WorktreeFilesLoaded {
-                            repo_id: worktree.repo_id,
-                            worktree_path: worktree.path,
-                            name: worktree.display_name,
-                            files: status.files,
-                            graph_key: status.graph_key,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Action::Error(format!("Worktree status: {}", e)));
-                    }
-                }
-            })
-            .await
-        });
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -462,9 +360,8 @@ impl App {
                         self.action_tx.send(Action::PollFetch)?;
                     }
                     Event::FocusGained => {
-                        if let Some(entry) = self.repo_list.selected_repo() {
-                            self.action_tx
-                                .send(Action::RefreshRepo(RepoId(entry.path.clone())))?;
+                        if let Some(id) = self.selected_repo_id() {
+                            self.action_tx.send(Action::RefreshRepo(id))?;
                         }
                     }
                     _ => {}
@@ -473,14 +370,12 @@ impl App {
 
             // Process actions
             while let Ok(action) = self.action_rx.try_recv() {
-                let render_after = !matches!(&action, Action::Tick | Action::Render);
-                if self.handle_git_action(&action)? {
-                    if render_after {
-                        render_requested = true;
-                    }
-                    continue;
-                }
-                if self.handle_repo_action(&action)? {
+                let render_after = !matches!(&action, Action::Tick);
+                if self.handle_git_action(&action)?
+                    || self.handle_repo_action(&action)?
+                    || self.handle_status_action(&action)?
+                    || self.handle_diff_action(&action)?
+                {
                     if render_after {
                         render_requested = true;
                     }
@@ -495,9 +390,6 @@ impl App {
                     Action::Quit => {
                         self.should_quit = true;
                     }
-                    Action::Render => {
-                        render_requested = true;
-                    }
                     Action::Resize(w, h) => {
                         tui.terminal
                             .resize(ratatui::layout::Rect::new(0, 0, w, h))?;
@@ -506,249 +398,15 @@ impl App {
                         if self.focused_repo.is_some() {
                             continue;
                         }
-                        self.context_menu.hide();
-                        self.active_worktree = None;
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &self.repo_list.repos[idx];
-                            let name = self.repo_display_name(idx);
-                            let path = entry.path.clone();
-                            let repo_id = id.clone();
-                            let files = entry
-                                .status
-                                .as_ref()
-                                .map(|s| s.files.clone())
-                                .unwrap_or_default();
-                            if let Some(status) = &entry.status {
-                                self.graph_keys
-                                    .insert(path.clone(), status.graph_key.clone());
-                            }
-                            self.file_list.set_files(files, &name, repo_id);
-                            self.git_graph.load_repo(path, &name);
-                            self.repo_list.select_repo_row(idx);
-                        }
-                    }
-                    Action::SelectWorktree {
-                        ref repo_id,
-                        ref worktree_path,
-                        ref worktree_branch,
-                    } => {
-                        self.context_menu.hide();
-
-                        let repo_name = self
-                            .repo_list
-                            .resolve_index(repo_id)
-                            .map(|i| self.repo_display_name(i))
-                            .unwrap_or_default();
-                        let display_name = format!("{}:{}", repo_name, worktree_branch);
-
-                        self.active_worktree = Some(ActiveWorktree {
-                            path: worktree_path.clone(),
-                            repo_id: repo_id.clone(),
-                            display_name: display_name.clone(),
-                            graph_key: crate::git::status::graph_cache_key(worktree_path).ok(),
-                        });
-
-                        // Clear file list while loading (use parent repo_id for resolve_index)
-                        self.file_list
-                            .set_files(Vec::new(), &display_name, repo_id.clone());
-
-                        // Load graph from worktree path
-                        self.git_graph
-                            .load_repo(worktree_path.clone(), &display_name);
-
-                        // Query worktree status in background
-                        if let Some(worktree) = self.active_worktree.clone() {
-                            self.spawn_worktree_status_query(worktree);
-                        }
-                    }
-                    Action::WorktreeFilesLoaded {
-                        repo_id,
-                        worktree_path,
-                        name,
-                        files,
-                        graph_key,
-                    } => {
-                        // Only apply if this worktree is still selected
-                        if self
-                            .active_worktree
-                            .as_ref()
-                            .is_some_and(|aw| aw.path == worktree_path)
-                        {
-                            self.file_list.set_files(files, &name, repo_id.clone());
-
-                            let graph_changed = self
-                                .active_worktree
-                                .as_ref()
-                                .is_some_and(|aw| aw.graph_key.as_deref() != Some(&graph_key));
-                            if graph_changed {
-                                if let Some(aw) = self.active_worktree.as_mut() {
-                                    aw.graph_key = Some(graph_key);
-                                }
-                                if self.git_graph.has_detail() {
-                                    self.git_graph.set_needs_reload();
-                                } else {
-                                    self.git_graph.load_repo(worktree_path, &name);
-                                }
-                            }
-                        }
-                    }
-                    Action::StatusQueryDone(ref id) => {
-                        self.pending_status.remove(id);
-                        // Clear git_op so the repo isn't permanently skipped
-                        // by future polls after a failed status query.
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            self.repo_list.repos[idx].git_op = false;
-                        }
-                        if self.dirty_repos.remove(id) {
-                            self.action_tx.send(Action::RefreshRepo(id.clone()))?;
-                        }
-                    }
-                    Action::RepoStatusUpdated { id, status } => {
-                        self.pending_status.remove(&id);
-                        let is_dirty = self.dirty_repos.remove(&id);
-                        if let Some(idx) = self.repo_list.resolve_index(&id) {
-                            let repo_path = self.repo_list.repos[idx].path.clone();
-                            let graph_changed =
-                                self.repo_graph_changed(repo_path.clone(), &status.graph_key);
-                            let remote_changed =
-                                self.repo_remote_changed(repo_path.clone(), &status.remote_key);
-                            let selected_repo = self.repo_list.selected_index() == Some(idx)
-                                && self.active_worktree.is_none();
-                            let selected_files = selected_repo.then(|| status.files.clone());
-                            let selected_name = self.repo_display_name(idx);
-                            self.repo_list.update_status(idx, status);
-
-                            // Refresh the file list so stale diffs are cleared
-                            // when files are staged/unstaged. Skip when a worktree
-                            // is being viewed — its files come from WorktreeFilesLoaded,
-                            // not the parent repo's status.
-                            if selected_repo {
-                                self.file_list.set_files(
-                                    selected_files.unwrap_or_default(),
-                                    &selected_name,
-                                    id.clone(),
-                                );
-
-                                if graph_changed {
-                                    if self.git_graph.has_detail() {
-                                        self.git_graph.set_needs_reload();
-                                    } else {
-                                        self.git_graph.load_repo(repo_path, &selected_name);
-                                    }
-                                } else if self.git_graph.current_generation() == 0 {
-                                    self.git_graph.load_repo(repo_path, &selected_name);
-                                } else if remote_changed {
-                                    self.git_graph.refresh_pushed_status();
-                                }
-                            } else if remote_changed {
-                                self.git_graph.refresh_pushed_status_for_path(repo_path);
-                            }
-                        }
-                        if is_dirty {
-                            self.action_tx.send(Action::RefreshRepo(id))?;
-                        }
-                    }
-                    Action::RefreshAll => {
-                        // User-initiated refresh: fetch from remote + show spinner
-                        let mut queries = Vec::new();
-                        for entry in self.repo_list.repos.iter_mut() {
-                            entry.git_op = true;
-                            let repo_id = RepoId(entry.path.clone());
-                            self.pending_status.insert(repo_id.clone());
-                            queries.push((repo_id, entry.path.clone()));
-                        }
-                        for (repo_id, path) in queries {
-                            self.spawn_status_query(
-                                repo_id,
-                                path,
-                                StatusQuery::Fetch,
-                                StatusFailure::UserVisible,
-                            );
-                        }
-                    }
-                    Action::PollLocal => {
-                        // Fast local status poll (no network, no spinner)
-                        let full_every = self.config.watch.poll_local_full_every.max(1);
-                        let full_scan = self.local_poll_tick == 0
-                            || self.local_poll_tick.is_multiple_of(full_every);
-                        self.local_poll_tick = self.local_poll_tick.saturating_add(1);
-
-                        for (idx, entry) in self.repo_list.repos.iter().enumerate() {
-                            let repo_id = RepoId(entry.path.clone());
-                            if entry.git_op || self.pending_status.contains(&repo_id) {
-                                continue;
-                            }
-                            if !self.should_poll_repo(&repo_id, idx, full_scan) {
-                                continue;
-                            }
-                            self.pending_status.insert(repo_id.clone());
-                            let path = entry.path.clone();
-                            self.spawn_status_query(
-                                repo_id,
-                                path,
-                                StatusQuery::Local,
-                                StatusFailure::Debug("Local poll failed"),
-                            );
-                        }
-
-                        // Also re-query the active worktree so its changes update live
-                        if let Some(aw) = self.active_worktree.clone() {
-                            self.spawn_worktree_status_query(aw);
-                        }
-                    }
-                    Action::PollFetch => {
-                        // Remote fetch poll (updates ahead/behind, no spinner)
-                        if self.fast_mode {
-                            continue;
-                        }
-                        for entry in self.repo_list.repos.iter() {
-                            let repo_id = RepoId(entry.path.clone());
-                            if entry.git_op || self.pending_status.contains(&repo_id) {
-                                continue;
-                            }
-                            self.pending_status.insert(repo_id.clone());
-                            let path = entry.path.clone();
-                            self.spawn_status_query(
-                                repo_id,
-                                path,
-                                StatusQuery::Fetch,
-                                StatusFailure::Debug("Fetch poll failed"),
-                            );
-                        }
-                    }
-                    Action::RefreshRepo(ref id) => {
-                        // Watcher-triggered: fast local-only, no spinner
-                        if self.pending_status.contains(id) {
-                            self.dirty_repos.insert(id.clone());
-                            tracing::debug!(
-                                "skipping repo {}: already in-flight (marked dirty)",
-                                id
-                            );
-                            continue;
-                        }
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let repo_id = id.clone();
-                            self.pending_status.insert(repo_id.clone());
-                            let path = self.repo_list.repos[idx].path.clone();
-                            self.spawn_status_query(
-                                repo_id,
-                                path,
-                                StatusQuery::Local,
-                                StatusFailure::UserVisible,
-                            );
-                        }
+                        self.select_repo(id);
                     }
                     Action::ShowGitGraph => {
-                        if let Some(entry) = self.repo_list.selected_repo() {
-                            let id = RepoId(entry.path.clone());
+                        if let Some(id) = self.selected_repo_id() {
                             self.open_repo_graph(&id);
                         }
                     }
                     Action::ShowRepoGitGraph(ref id) => {
                         self.open_repo_graph(id);
-                    }
-                    Action::ShowFileList => {
-                        self.focus = FocusPanel::Changes;
                     }
                     Action::GraphLoaded { generation, rows } => {
                         if generation == self.git_graph.current_generation() {
@@ -769,40 +427,12 @@ impl App {
                         self.git_graph.set_error(msg.clone());
                     }
                     Action::ShowContextMenu { ref id, row, col } => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let (
-                                ahead,
-                                behind,
-                                has_upstream,
-                                has_submodules,
-                                has_github_remote,
-                                has_origin_remote,
-                            ) = self.repo_list.repos[idx]
-                                .status
-                                .as_ref()
-                                .map(|s| {
-                                    (
-                                        s.ahead,
-                                        s.behind,
-                                        s.has_upstream,
-                                        s.has_submodules,
-                                        s.has_github_remote,
-                                        s.has_origin_remote,
-                                    )
-                                })
-                                .unwrap_or((0, 0, false, false, false, false));
+                        if let Some(entry) = self.repo_list.resolve_entry(id) {
                             self.context_menu.show(
                                 id.clone(),
                                 col,
                                 row,
-                                RepoMenuState {
-                                    ahead,
-                                    behind,
-                                    has_upstream,
-                                    has_submodules,
-                                    has_github_remote,
-                                    has_origin_remote,
-                                },
+                                entry.status.as_ref().into(),
                             );
                         }
                     }
@@ -817,18 +447,14 @@ impl App {
                         self.action_tx.send(Action::PollLocal)?;
                     }
                     Action::CopyPath(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &self.repo_list.repos[idx];
+                        if let Some(entry) = self.repo_list.resolve_entry(id) {
                             let path_str = entry.path.to_string_lossy().to_string();
-                            use std::io::Write;
-                            let encoded = base64_encode(path_str.as_bytes());
-                            let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", encoded);
-                            let _ = std::io::stdout().flush();
+                            copy_to_clipboard(&path_str);
                         }
                     }
                     Action::OpenGitHub(ref id) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let url = self.repo_list.repos[idx]
+                        if let Some(entry) = self.repo_list.resolve_entry(id) {
+                            let url = entry
                                 .status
                                 .as_ref()
                                 .and_then(|status| status.github_url.as_deref());
@@ -850,24 +476,20 @@ impl App {
                     }
                     Action::StartCommit(ref id) => {
                         self.context_menu.hide();
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            self.commit_input
-                                .show(id.clone(), self.repo_display_name(idx));
+                        if let Some(name) = self.repo_list.display_name_for_id(id) {
+                            self.commit_input.show(id.clone(), name);
                         }
                     }
-                    Action::UpdateCommitMessage(ref _message) => {}
                     Action::CancelCommit => {
                         self.commit_input.hide();
                     }
                     Action::StartCreateGitHubRepo { ref id, private } => {
                         self.context_menu.hide();
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &self.repo_list.repos[idx];
+                        if let Some(entry) = self.repo_list.resolve_entry(id) {
                             self.github_repo_input
                                 .show(id.clone(), private, entry.name.clone());
                         }
                     }
-                    Action::UpdateGitHubRepoName(ref _name) => {}
                     Action::CancelCreateGitHubRepo => {
                         self.github_repo_input.hide();
                     }
@@ -877,16 +499,13 @@ impl App {
                         };
                         let repo_name = self.github_repo_input.name().trim().to_string();
                         if repo_name.is_empty() {
-                            self.error_message =
-                                Some(("Repository name is empty".to_string(), Instant::now()));
+                            self.set_error_message("Repository name is empty");
                             continue;
                         }
                         if !is_valid_github_repo_name(&repo_name) {
-                            self.error_message = Some((
+                            self.set_error_message(
                                 "Repository name can only contain letters, numbers, '.', '_' and '-'"
-                                    .to_string(),
-                                Instant::now(),
-                            ));
+                            );
                             continue;
                         }
                         self.action_tx.send(Action::CreateGitHubRepo {
@@ -902,20 +521,18 @@ impl App {
                         };
                         let message = self.commit_input.message().trim().to_string();
                         if message.is_empty() {
-                            self.error_message =
-                                Some(("Commit message is empty".to_string(), Instant::now()));
+                            self.set_error_message("Commit message is empty");
                             continue;
                         }
                         if let Some(idx) = self.repo_list.resolve_index(&repo_id) {
-                            let entry = &mut self.repo_list.repos[idx];
-                            entry.git_op = true;
-                            let path = entry.path.clone();
                             let repo_name = self.repo_display_name(idx);
                             let no_verify = self.config.commit.no_verify;
                             self.commit_input.hide();
-                            self.spawn_git_operation(
-                                repo_id,
-                                move || crate::git::commit_all(&path, &message, no_verify),
+                            self.spawn_repo_operation(
+                                idx,
+                                &repo_id,
+                                format!("Committing {repo_name}..."),
+                                move |path| crate::git::commit_all(&path, &message, no_verify),
                                 move |_| format!("Committed {}", repo_name),
                                 Some("Commit failed"),
                             );
@@ -925,284 +542,9 @@ impl App {
                         ref id,
                         ref message,
                     } => {
-                        self.success_message = Some((message.clone(), Instant::now()));
+                        self.set_success_message(message.clone());
                         self.add_operation_log(message.clone());
                         self.action_tx.send(Action::RefreshRepo(id.clone()))?;
-                    }
-                    Action::ShowDiff(ref id, ref file_path) => {
-                        if let Some(idx) = self.repo_list.resolve_index(id) {
-                            let entry = &self.repo_list.repos[idx];
-                            let diff_gen = self.file_list.diff_generation();
-                            let sub_info = entry
-                                .status
-                                .as_ref()
-                                .and_then(|s| s.submodules.iter().find(|sm| sm.path == *file_path));
-
-                            if let Some(sub) = sub_info {
-                                let repo_path = entry.path.clone();
-                                let sub_path = file_path.clone();
-                                let old_oid = sub.head_oid.clone().unwrap_or_default();
-                                let new_oid = sub.workdir_oid.clone().unwrap_or_default();
-                                let sub_state = sub.state.clone();
-                                let tx = self.action_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let submodule_abs = repo_path.join(&sub_path);
-                                    let short_old = if old_oid.len() >= 7 {
-                                        &old_oid[..7]
-                                    } else {
-                                        &old_oid
-                                    };
-                                    let short_new = if new_oid.len() >= 7 {
-                                        &new_oid[..7]
-                                    } else {
-                                        &new_oid
-                                    };
-
-                                    // Dirty submodule (local uncommitted changes): show git diff
-                                    // Modified submodule (pointer changed): show commit log
-                                    let pointer_changed = !old_oid.is_empty()
-                                        && !new_oid.is_empty()
-                                        && old_oid != new_oid;
-                                    let use_diff = sub_state
-                                        == crate::git::status::SubmoduleState::Dirty
-                                        || !pointer_changed;
-
-                                    if use_diff {
-                                        let header = format!(
-                                            "Submodule {} ({})\n{}\n",
-                                            sub_path.display(),
-                                            match sub_state {
-                                                crate::git::status::SubmoduleState::Dirty => "uncommitted changes",
-                                                crate::git::status::SubmoduleState::Uninitialized => "not initialized",
-                                                crate::git::status::SubmoduleState::Modified => "modified",
-                                            },
-                                            "─".repeat(40),
-                                        );
-                                        let mut command = std::process::Command::new("git");
-                                        command
-                                            .arg("-C")
-                                            .arg(&submodule_abs)
-                                            .args(["diff", "HEAD"]);
-                                        crate::git::configure_noninteractive(&mut command);
-                                        let output = command.output();
-                                        let body = match output {
-                                            Ok(o) => {
-                                                let text =
-                                                    String::from_utf8_lossy(&o.stdout).to_string();
-                                                if text.is_empty() {
-                                                    // Fallback: show status
-                                                    let mut command =
-                                                        std::process::Command::new("git");
-                                                    command
-                                                        .arg("-C")
-                                                        .arg(&submodule_abs)
-                                                        .args(["status", "--short"]);
-                                                    crate::git::configure_noninteractive(
-                                                        &mut command,
-                                                    );
-                                                    let status_out = command
-                                                        .output()
-                                                        .map(|o| {
-                                                            String::from_utf8_lossy(&o.stdout)
-                                                                .to_string()
-                                                        })
-                                                        .unwrap_or_default();
-                                                    if status_out.is_empty() {
-                                                        "(no changes detected)".to_string()
-                                                    } else {
-                                                        status_out
-                                                    }
-                                                } else {
-                                                    text
-                                                }
-                                            }
-                                            Err(e) => {
-                                                format!("Failed to get submodule diff: {}", e)
-                                            }
-                                        };
-                                        let _ = tx.send(Action::DiffLoaded {
-                                            generation: diff_gen,
-                                            content: format!("{}{}", header, body),
-                                        });
-                                    } else {
-                                        // Pointer changed: show commit log between old and new
-                                        let header = format!(
-                                            "Submodule {} → {}\n{}\n",
-                                            short_old,
-                                            short_new,
-                                            "─".repeat(40),
-                                        );
-                                        let range = format!("{}..{}", old_oid, new_oid);
-                                        let mut command = std::process::Command::new("git");
-                                        command.arg("-C").arg(&submodule_abs).args([
-                                            "log",
-                                            "--oneline",
-                                            "--graph",
-                                            &range,
-                                        ]);
-                                        crate::git::configure_noninteractive(&mut command);
-                                        let output = command.output();
-                                        let body = match output {
-                                            Ok(o) => {
-                                                let text =
-                                                    String::from_utf8_lossy(&o.stdout).to_string();
-                                                if text.is_empty() {
-                                                    "(no commits in range)".to_string()
-                                                } else {
-                                                    text
-                                                }
-                                            }
-                                            Err(e) => format!("Failed to get submodule log: {}", e),
-                                        };
-                                        let _ = tx.send(Action::DiffLoaded {
-                                            generation: diff_gen,
-                                            content: format!("{}{}", header, body),
-                                        });
-                                    }
-                                });
-                            } else {
-                                // Use worktree path for diffs when a worktree is selected
-                                let path = self
-                                    .active_worktree
-                                    .as_ref()
-                                    .map(|aw| aw.path.clone())
-                                    .unwrap_or_else(|| entry.path.clone());
-                                let fp = file_path.clone();
-                                let tx = self.action_tx.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut command = std::process::Command::new("git");
-                                    command
-                                        .arg("-C")
-                                        .arg(&path)
-                                        .arg("diff")
-                                        .arg("HEAD")
-                                        .arg("--")
-                                        .arg(&fp);
-                                    crate::git::configure_noninteractive(&mut command);
-                                    let output = command.output();
-                                    match output {
-                                        Ok(o) => {
-                                            let mut text =
-                                                String::from_utf8_lossy(&o.stdout).to_string();
-                                            if text.is_empty() {
-                                                text = String::from_utf8_lossy(&{
-                                                    let mut command =
-                                                        std::process::Command::new("git");
-                                                    command
-                                                        .arg("-C")
-                                                        .arg(&path)
-                                                        .arg("diff")
-                                                        .arg("--no-index")
-                                                        .arg("/dev/null")
-                                                        .arg(&fp);
-                                                    crate::git::configure_noninteractive(
-                                                        &mut command,
-                                                    );
-                                                    command
-                                                        .output()
-                                                        .map(|o| o.stdout)
-                                                        .unwrap_or_default()
-                                                })
-                                                .to_string();
-                                            }
-                                            if text.is_empty() {
-                                                text = "(no diff available)".to_string();
-                                            }
-                                            let _ = tx.send(Action::DiffLoaded {
-                                                generation: diff_gen,
-                                                content: text,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Action::DiffLoaded {
-                                                generation: diff_gen,
-                                                content: format!("Failed to get diff: {}", e),
-                                            });
-                                        }
-                                    }
-                                });
-                            }
-                        }
-                    }
-                    Action::DiffLoaded {
-                        generation,
-                        content,
-                    } => {
-                        if generation == self.file_list.diff_generation() {
-                            self.file_list.set_diff(content);
-                        }
-                    }
-                    Action::ShowCommitFiles {
-                        ref repo_path,
-                        ref oid,
-                    } => {
-                        let detail_gen = self.git_graph.current_detail_generation();
-                        let path = repo_path.clone();
-                        let oid = oid.clone();
-                        let tx = self.action_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            match crate::git::commit_files::list_commit_files(&path, &oid) {
-                                Ok((message, files)) => {
-                                    let _ = tx.send(Action::CommitFilesLoaded {
-                                        generation: detail_gen,
-                                        oid,
-                                        message,
-                                        files,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Action::Error(format!(
-                                        "Failed to list commit files: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        });
-                    }
-                    Action::CommitFilesLoaded {
-                        generation,
-                        oid,
-                        message,
-                        files,
-                    } => {
-                        if generation == self.git_graph.current_detail_generation() {
-                            self.git_graph.set_commit_files(oid, message, files);
-                        }
-                    }
-                    Action::ShowCommitDiff {
-                        ref repo_path,
-                        ref oid,
-                        ref file_path,
-                    } => {
-                        let detail_gen = self.git_graph.current_detail_generation();
-                        let path = repo_path.clone();
-                        let oid = oid.clone();
-                        let fp = file_path.clone();
-                        let tx = self.action_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            match crate::git::commit_files::commit_file_diff(&path, &oid, &fp) {
-                                Ok(diff) => {
-                                    let _ = tx.send(Action::CommitDiffLoaded {
-                                        generation: detail_gen,
-                                        content: diff,
-                                    });
-                                }
-                                Err(e) => {
-                                    let _ = tx.send(Action::Error(format!(
-                                        "Failed to get commit diff: {}",
-                                        e
-                                    )));
-                                }
-                            }
-                        });
-                    }
-                    Action::CommitDiffLoaded {
-                        generation,
-                        content,
-                    } => {
-                        if generation == self.git_graph.current_detail_generation() {
-                            self.git_graph.set_commit_diff(content);
-                        }
                     }
                     Action::UpdateAvailable(ref version) => {
                         self.update_version = Some(version.clone());
@@ -1210,17 +552,7 @@ impl App {
                     Action::Error(ref msg) => {
                         tracing::debug!("{}", msg);
                         self.add_operation_log(format!("Error: {msg}"));
-                        // Sanitize: single line, max 120 chars for status bar
-                        let clean: String = msg
-                            .chars()
-                            .map(|c| if c == '\n' { ' ' } else { c })
-                            .collect();
-                        let truncated = if clean.len() > 120 {
-                            format!("{}...", &clean[..117])
-                        } else {
-                            clean
-                        };
-                        self.error_message = Some((truncated, Instant::now()));
+                        self.set_sanitized_error_message(msg);
                     }
                     Action::Notice(ref msg) => {
                         tracing::debug!("{}", msg);
@@ -1247,102 +579,6 @@ impl App {
                 })?;
             }
         }
-        Ok(())
-    }
-
-    fn draw(&mut self, frame: &mut ratatui::Frame) -> Result<()> {
-        let area = frame.area();
-
-        // Vertical: main area + status bar
-        let outer = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(1)])
-            .split(area);
-
-        let main_area = outer[0];
-        let status_area = outer[1];
-
-        // Three-panel layout: repositories on top, changes in the middle,
-        // graph at the bottom. Drag the horizontal borders to resize.
-        let h = main_area.height as f64;
-        let r1 = (self.border_frac[0] * h).round() as u16;
-        let r2 = ((self.border_frac[1] - self.border_frac[0]) * h).round() as u16;
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(r1),
-                Constraint::Length(r2),
-                Constraint::Min(3),
-            ])
-            .split(main_area);
-        let (repo_area, changes_area, graph_area) = (chunks[0], chunks[1], chunks[2]);
-
-        self.repo_area = repo_area;
-        self.changes_area = changes_area;
-        self.graph_area = graph_area;
-
-        self.repo_list.focused = self.focus == FocusPanel::Repos;
-        self.file_list.focused = self.focus == FocusPanel::Changes;
-        self.git_graph.focused = self.focus == FocusPanel::Graph;
-
-        self.file_list.horizontal_layout = false;
-        self.git_graph.horizontal_layout = false;
-
-        self.repo_list.draw(frame, repo_area)?;
-        self.file_list.draw(frame, changes_area)?;
-        self.git_graph.draw(frame, graph_area)?;
-
-        if self.dragging_border.is_some() {
-            // Only highlight the seam during active drag.
-            use ratatui::style::{Color, Style};
-
-            let style = Style::default().fg(Color::Yellow);
-            let buf = frame.buffer_mut();
-            for (dragging, y) in [
-                (self.dragging_border == Some(0), changes_area.y),
-                (self.dragging_border == Some(1), graph_area.y),
-            ] {
-                if !dragging {
-                    continue;
-                }
-                // Paint just the border characters (skip first col = title area preserved)
-                for x in repo_area.x..repo_area.x + repo_area.width {
-                    if let Some(cell) = buf.cell_mut(ratatui::layout::Position::new(x, y)) {
-                        cell.set_style(style);
-                    }
-                }
-            }
-        }
-
-        self.status_bar.focus = self.focus;
-        self.status_bar.error = self.error_message.clone();
-        self.status_bar.success = self.success_message.clone();
-        self.status_bar.fast_mode = self.fast_mode;
-        self.status_bar.focused_repo = self.focused_repo_name();
-        self.status_bar.draw(frame, status_area)?;
-
-        // Overlays rendered last
-        self.context_menu.draw(frame, area)?;
-        self.path_input.draw(frame, area);
-        self.commit_input.draw(frame, area);
-        self.github_repo_input.draw(frame, area);
-        self.confirm_dialog.draw(frame, area);
-        self.notice_dialog.draw(frame, area)?;
-
-        // Update notification overlay
-        if let Some(ref version) = self.update_version {
-            self.draw_update_notification(frame, main_area, version);
-        }
-
-        // Help overlay (rendered last so it's on top of everything)
-        if self.show_help {
-            self.draw_help(frame, main_area);
-        }
-
-        if self.show_operation_log {
-            self.draw_operation_log(frame, main_area);
-        }
-
         Ok(())
     }
 }

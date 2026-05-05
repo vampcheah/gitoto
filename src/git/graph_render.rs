@@ -1,8 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier};
 use ratatui::text::Span;
 
+use crate::components::style::{fg_span, fg_style};
 use crate::git::graph::{BranchLabel, GraphRow, LaneSegment, lane_color};
 
 const PALETTE: [Color; 6] = [
@@ -38,8 +39,6 @@ pub(crate) fn render_graph_prefix(row: &GraphRow) -> Vec<Span<'static>> {
                 .unwrap_or(PALETTE[lane_color(col)]),
             _ => PALETTE[lane_color(col)],
         };
-        let style = Style::default().fg(color);
-
         let ch = match segment {
             LaneSegment::Empty => " ",
             LaneSegment::Straight => "│",
@@ -54,7 +53,7 @@ pub(crate) fn render_graph_prefix(row: &GraphRow) -> Vec<Span<'static>> {
             LaneSegment::LeftTee => "┤",
         };
 
-        spans.push(Span::styled(ch.to_string(), style));
+        spans.push(fg_span(ch.to_string(), color));
 
         // Inter-column space: ─ if within a horizontal span, " " otherwise
         let h_span = row
@@ -62,10 +61,7 @@ pub(crate) fn render_graph_prefix(row: &GraphRow) -> Vec<Span<'static>> {
             .iter()
             .find(|s| s.0 <= col && col < s.1);
         if let Some(s) = h_span {
-            spans.push(Span::styled(
-                "─".to_string(),
-                Style::default().fg(PALETTE[s.2]),
-            ));
+            spans.push(fg_span("─", PALETTE[s.2]));
         } else {
             spans.push(Span::raw(" "));
         }
@@ -79,12 +75,12 @@ pub(crate) fn render_branch_labels(labels: &[BranchLabel], max_len: usize) -> Ve
         return Vec::new();
     }
 
-    let paren_style = Style::default().fg(Color::Yellow);
-    let mut spans = vec![Span::styled("(".to_string(), paren_style)];
+    let paren_style = fg_style(Color::Yellow);
+    let mut spans = vec![Span::styled("(", paren_style)];
 
     for (i, label) in labels.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::styled(", ".to_string(), paren_style));
+            spans.push(Span::styled(", ", paren_style));
         }
 
         let (prefix, color) = if label.is_head {
@@ -100,7 +96,7 @@ pub(crate) fn render_branch_labels(labels: &[BranchLabel], max_len: usize) -> Ve
         };
 
         if !prefix.is_empty() {
-            spans.push(Span::styled(prefix.to_string(), Style::default().fg(color)));
+            spans.push(fg_span(prefix.to_string(), color));
         }
 
         let name = if label.name.len() > max_len {
@@ -111,10 +107,77 @@ pub(crate) fn render_branch_labels(labels: &[BranchLabel], max_len: usize) -> Ve
             label.name.clone()
         };
 
-        spans.push(Span::styled(name, Style::default().fg(color)));
+        spans.push(fg_span(name, color));
     }
 
-    spans.push(Span::styled(") ".to_string(), paren_style));
+    spans.push(Span::styled(") ", paren_style));
+    spans
+}
+
+pub(crate) fn render_commit_row(
+    row: &GraphRow,
+    label_max_len: usize,
+    dimmed: bool,
+) -> Vec<Span<'static>> {
+    let is_collapsed = row.collapsed.is_some();
+    let mut spans = render_graph_prefix(row);
+
+    if dimmed || is_collapsed {
+        for span in &mut spans {
+            span.style = fg_style(Color::DarkGray);
+        }
+    }
+
+    if is_collapsed {
+        spans.push(Span::styled(
+            row.message.clone(),
+            fg_style(Color::Rgb(130, 130, 130)).add_modifier(Modifier::ITALIC),
+        ));
+        return spans;
+    }
+
+    let id_style = if dimmed {
+        fg_style(Color::DarkGray)
+    } else {
+        fg_style(Color::Yellow).add_modifier(Modifier::BOLD)
+    };
+    spans.push(Span::styled(format!("{} ", row.short_id), id_style));
+
+    if !dimmed {
+        spans.extend(render_branch_labels(&row.labels, label_max_len));
+    }
+
+    let msg_color = if dimmed {
+        Color::DarkGray
+    } else if row.is_merge {
+        Color::Rgb(130, 130, 130)
+    } else {
+        Color::White
+    };
+    spans.push(fg_span(row.message.clone(), msg_color));
+
+    let author_color = if dimmed {
+        Color::DarkGray
+    } else {
+        author_color(&row.author)
+    };
+    spans.push(fg_span(format!("  — {}", row.author), author_color));
+    spans.push(fg_span(
+        format!(" {}", format_relative_time(row.time)),
+        Color::DarkGray,
+    ));
+
+    if let Some(ref stat) = row.diff_stat
+        && !dimmed
+    {
+        if stat.additions > 0 {
+            spans.push(fg_span(format!(" +{}", stat.additions), Color::Green));
+        }
+        if stat.deletions > 0 {
+            spans.push(fg_span(format!(" -{}", stat.deletions), Color::Red));
+        }
+    }
+
     spans
 }
 
@@ -345,70 +408,22 @@ mod tests {
     }
 
     #[test]
-    fn test_relative_time_seconds() {
+    fn test_relative_time_formats() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs() as i64;
-        assert_eq!(format_relative_time(now - 30), "30s ago");
-    }
-
-    #[test]
-    fn test_relative_time_hours() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert_eq!(format_relative_time(now - 7200), "2h ago");
-    }
-
-    #[test]
-    fn test_relative_time_days() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        assert_eq!(format_relative_time(now - 259200), "3d ago");
-    }
-
-    #[test]
-    fn test_relative_time_weeks() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        // 2 weeks = 14 days = 14*86400 = 1209600
-        assert_eq!(format_relative_time(now - 1_209_600), "2w ago");
-    }
-
-    #[test]
-    fn test_relative_time_months() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        // ~5 months = 5 * 30 days = 12960000
-        assert_eq!(format_relative_time(now - 12_960_000), "5mo ago");
-    }
-
-    #[test]
-    fn test_relative_time_years() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        // ~2 years = 2 * 365 days = 63072000
-        assert_eq!(format_relative_time(now - 63_072_000), "2y ago");
-    }
-
-    #[test]
-    fn test_relative_time_future_clamps_to_zero() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        // Future timestamp
-        assert_eq!(format_relative_time(now + 1000), "0s ago");
+        for (offset, expected) in [
+            (30, "30s ago"),
+            (7200, "2h ago"),
+            (259_200, "3d ago"),
+            (1_209_600, "2w ago"),
+            (12_960_000, "5mo ago"),
+            (63_072_000, "2y ago"),
+            (-1000, "0s ago"),
+        ] {
+            assert_eq!(format_relative_time(now - offset), expected);
+        }
     }
 
     #[test]
@@ -423,29 +438,17 @@ mod tests {
 
     #[test]
     fn test_render_graph_prefix_horizontal_dash_between_spans() {
-        use crate::git::graph::{GraphRow, LaneSegment, lane_color};
-        use git2::Oid;
+        use crate::git::graph::{LaneSegment, lane_color};
+        use crate::git::test_support;
 
-        let row = GraphRow {
-            commit_col: 2,
-            lanes: vec![
-                LaneSegment::RightTee,
-                LaneSegment::CrossHorizontal,
-                LaneSegment::MergeLeft,
-            ],
-            horizontal_spans: vec![(0, 2, lane_color(2))],
-            oid: Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            short_id: String::new(),
-            message: String::new(),
-            author: String::new(),
-            time: 0,
-            labels: Vec::new(),
-            is_pushed: false,
-            is_merge: false,
-            parent_oids: Vec::new(),
-            diff_stat: None,
-            collapsed: None,
-        };
+        let mut row =
+            test_support::graph_row("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", Vec::new());
+        row.lanes = vec![
+            LaneSegment::RightTee,
+            LaneSegment::CrossHorizontal,
+            LaneSegment::MergeLeft,
+        ];
+        row.horizontal_spans = vec![(0, 2, lane_color(2))];
 
         let spans = render_graph_prefix(&row);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -455,25 +458,10 @@ mod tests {
 
     #[test]
     fn test_commit_dot_red_when_unpushed() {
-        use crate::git::graph::{GraphRow, LaneSegment};
-        use git2::Oid;
+        use crate::git::test_support;
 
-        let row = GraphRow {
-            commit_col: 0,
-            lanes: vec![LaneSegment::Commit],
-            horizontal_spans: Vec::new(),
-            oid: Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            short_id: String::new(),
-            message: String::new(),
-            author: String::new(),
-            time: 0,
-            labels: Vec::new(),
-            is_pushed: false,
-            is_merge: false,
-            parent_oids: Vec::new(),
-            diff_stat: None,
-            collapsed: None,
-        };
+        let row =
+            test_support::graph_row("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", Vec::new());
 
         let spans = render_graph_prefix(&row);
         assert_eq!(spans[0].content.as_ref(), "●");
@@ -482,25 +470,11 @@ mod tests {
 
     #[test]
     fn test_commit_dot_green_when_pushed() {
-        use crate::git::graph::{GraphRow, LaneSegment};
-        use git2::Oid;
+        use crate::git::test_support;
 
-        let row = GraphRow {
-            commit_col: 0,
-            lanes: vec![LaneSegment::Commit],
-            horizontal_spans: Vec::new(),
-            oid: Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            short_id: String::new(),
-            message: String::new(),
-            author: String::new(),
-            time: 0,
-            labels: Vec::new(),
-            is_pushed: true,
-            is_merge: false,
-            parent_oids: Vec::new(),
-            diff_stat: None,
-            collapsed: None,
-        };
+        let mut row =
+            test_support::graph_row("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "", Vec::new());
+        row.is_pushed = true;
 
         let spans = render_graph_prefix(&row);
         assert_eq!(spans[0].content.as_ref(), "●");

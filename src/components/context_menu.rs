@@ -3,17 +3,21 @@ use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKin
 use ratatui::{
     Frame,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState},
+    widgets::{Clear, ListItem, ListState},
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::panel;
+use crate::components::selection;
+use crate::components::style::{bold_fg_span, fg_style};
+use crate::git::status::RepoStatus;
 use crate::repo_id::RepoId;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 enum MenuAction {
     OpenGraph,
     Refresh,
@@ -31,6 +35,44 @@ enum MenuAction {
     SubmoduleUpdate,
     SubmoduleSync,
     SubmoduleUpdateLatest,
+}
+
+impl MenuAction {
+    fn into_action(self, id: RepoId) -> Action {
+        match self {
+            Self::OpenGraph => Action::ShowRepoGitGraph(id),
+            Self::Refresh => Action::RefreshRepo(id),
+            Self::CopyPath => Action::CopyPath(id),
+            Self::OpenGitHub => Action::OpenGitHub(id),
+            Self::Commit => Action::StartCommit(id),
+            Self::Push => Action::GitPush(id),
+            Self::Publish => Action::GitPublish(id),
+            Self::CreateGithubPrivate => Action::StartCreateGitHubRepo { id, private: true },
+            Self::CreateGithubPublic => Action::StartCreateGitHubRepo { id, private: false },
+            Self::Pull => Action::GitPull(id),
+            Self::PullRebase => Action::GitPullRebase(id),
+            Self::PullSubmodules => Action::GitPullSubmodules(id),
+            Self::RemoveOriginRemote => Action::RemoveOriginRemote(id),
+            Self::SubmoduleUpdate => Action::GitSubmoduleUpdate(id),
+            Self::SubmoduleSync => Action::GitSubmoduleSync(id),
+            Self::SubmoduleUpdateLatest => Action::GitSubmoduleUpdateLatest(id),
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::Push => fg_style(Color::Green),
+            Self::Commit | Self::Publish | Self::CreateGithubPrivate | Self::CreateGithubPublic => {
+                fg_style(Color::Cyan)
+            }
+            Self::Pull | Self::PullRebase | Self::PullSubmodules => fg_style(Color::Yellow),
+            Self::RemoveOriginRemote => fg_style(Color::Red),
+            Self::SubmoduleUpdate | Self::SubmoduleSync | Self::SubmoduleUpdateLatest => {
+                fg_style(Color::LightMagenta)
+            }
+            _ => Style::default(),
+        }
+    }
 }
 
 struct MenuItem {
@@ -52,6 +94,40 @@ fn separator(label: impl Into<String>) -> MenuItem {
     }
 }
 
+fn push_section<L>(
+    items: &mut Vec<MenuItem>,
+    label: &'static str,
+    actions: impl IntoIterator<Item = (L, MenuAction)>,
+) where
+    L: Into<String>,
+{
+    items.push(separator(label));
+    items.extend(
+        actions
+            .into_iter()
+            .map(|(label, action)| menu_item(label, action)),
+    );
+}
+
+fn push_label(state: &RepoMenuState) -> String {
+    if !state.has_upstream {
+        "Push (publish first)".to_string()
+    } else if state.ahead > 0 {
+        format!("Push  ↑{}", state.ahead)
+    } else {
+        "Push".to_string()
+    }
+}
+
+fn pull_label(state: &RepoMenuState) -> String {
+    if state.behind > 0 {
+        format!("Pull  ↓{}", state.behind)
+    } else {
+        "Pull".to_string()
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct RepoMenuState {
     pub ahead: usize,
     pub behind: usize,
@@ -59,6 +135,21 @@ pub(crate) struct RepoMenuState {
     pub has_submodules: bool,
     pub has_github_remote: bool,
     pub has_origin_remote: bool,
+}
+
+impl From<Option<&RepoStatus>> for RepoMenuState {
+    fn from(status: Option<&RepoStatus>) -> Self {
+        status
+            .map(|s| Self {
+                ahead: s.ahead,
+                behind: s.behind,
+                has_upstream: s.has_upstream,
+                has_submodules: s.has_submodules,
+                has_github_remote: s.has_github_remote,
+                has_origin_remote: s.has_origin_remote,
+            })
+            .unwrap_or_default()
+    }
 }
 
 pub(crate) struct ContextMenu {
@@ -89,75 +180,73 @@ impl ContextMenu {
         self.repo_id = Some(repo_id);
         self.position = (col, row);
 
-        self.items = vec![
-            separator("Repository"),
-            menu_item("Open git graph", MenuAction::OpenGraph),
-            menu_item("Refresh", MenuAction::Refresh),
-            menu_item("Copy path", MenuAction::CopyPath),
-            menu_item("Commit all changes", MenuAction::Commit),
-            separator("Remote"),
-            MenuItem {
-                label: if !repo_state.has_upstream {
-                    "Push (publish first)".into()
-                } else if repo_state.ahead > 0 {
-                    format!("Push  ↑{}", repo_state.ahead)
-                } else {
-                    "Push".into()
-                },
-                action: Some(MenuAction::Push),
-            },
-            menu_item("Publish branch", MenuAction::Publish),
-            MenuItem {
-                label: if repo_state.behind > 0 {
-                    format!("Pull  ↓{}", repo_state.behind)
-                } else {
-                    "Pull".into()
-                },
-                action: Some(MenuAction::Pull),
-            },
-            menu_item("Pull --rebase", MenuAction::PullRebase),
-        ];
+        let mut items = Vec::new();
+        push_section(
+            &mut items,
+            "Repository",
+            [
+                ("Open git graph", MenuAction::OpenGraph),
+                ("Refresh", MenuAction::Refresh),
+                ("Copy path", MenuAction::CopyPath),
+                ("Commit all changes", MenuAction::Commit),
+            ],
+        );
+        push_section(
+            &mut items,
+            "Remote",
+            [
+                (push_label(&repo_state), MenuAction::Push),
+                (String::from("Publish branch"), MenuAction::Publish),
+                (pull_label(&repo_state), MenuAction::Pull),
+                (String::from("Pull --rebase"), MenuAction::PullRebase),
+            ],
+        );
 
         if repo_state.has_github_remote {
-            self.items.push(separator("GitHub"));
-            self.items
-                .push(menu_item("Open GitHub", MenuAction::OpenGitHub));
-        }
-
-        if !repo_state.has_github_remote {
-            self.items.push(separator("GitHub"));
-            self.items.push(menu_item(
-                "Create GitHub repo (private)",
-                MenuAction::CreateGithubPrivate,
-            ));
-            self.items.push(menu_item(
-                "Create GitHub repo (public)",
-                MenuAction::CreateGithubPublic,
-            ));
+            push_section(
+                &mut items,
+                "GitHub",
+                [("Open GitHub", MenuAction::OpenGitHub)],
+            );
+        } else {
+            push_section(
+                &mut items,
+                "GitHub",
+                [
+                    (
+                        "Create GitHub repo (private)",
+                        MenuAction::CreateGithubPrivate,
+                    ),
+                    (
+                        "Create GitHub repo (public)",
+                        MenuAction::CreateGithubPublic,
+                    ),
+                ],
+            );
         }
 
         if repo_state.has_submodules {
-            self.items.push(separator("Submodules"));
-            self.items
-                .push(menu_item("Pull --recurse-subs", MenuAction::PullSubmodules));
-            self.items
-                .push(menu_item("Sub: update --init", MenuAction::SubmoduleUpdate));
-            self.items
-                .push(menu_item("Sub: sync", MenuAction::SubmoduleSync));
-            self.items.push(menu_item(
-                "Sub: pull latest",
-                MenuAction::SubmoduleUpdateLatest,
-            ));
+            push_section(
+                &mut items,
+                "Submodules",
+                [
+                    ("Pull --recurse-subs", MenuAction::PullSubmodules),
+                    ("Sub: update --init", MenuAction::SubmoduleUpdate),
+                    ("Sub: sync", MenuAction::SubmoduleSync),
+                    ("Sub: pull latest", MenuAction::SubmoduleUpdateLatest),
+                ],
+            );
         }
 
         if repo_state.has_origin_remote {
-            self.items.push(separator("Danger"));
-            self.items.push(menu_item(
-                "Remove origin remote",
-                MenuAction::RemoveOriginRemote,
-            ));
+            push_section(
+                &mut items,
+                "Danger",
+                [("Remove origin remote", MenuAction::RemoveOriginRemote)],
+            );
         }
 
+        self.items = items;
         self.select_first_action();
     }
 
@@ -187,26 +276,6 @@ impl ContextMenu {
         Rect::new(x, y, width, height)
     }
 
-    fn select_next(&mut self) {
-        if self.items.is_empty() {
-            return;
-        }
-        let start = self.state.selected().unwrap_or(0);
-        let i = (start + 1..self.items.len())
-            .find(|i| self.items[*i].action.is_some())
-            .unwrap_or(start);
-        self.state.select(Some(i));
-    }
-
-    fn select_prev(&mut self) {
-        let start = self.state.selected().unwrap_or(0);
-        let i = (0..start)
-            .rev()
-            .find(|i| self.items[*i].action.is_some())
-            .unwrap_or(start);
-        self.state.select(Some(i));
-    }
-
     fn select_first_action(&mut self) {
         let idx = self.items.iter().position(|item| item.action.is_some());
         self.state.select(idx);
@@ -216,25 +285,7 @@ impl ContextMenu {
         let idx = self.state.selected()?;
         let item = self.items.get(idx)?;
         let id = self.repo_id.clone()?;
-        let menu_action = item.action.clone()?;
-        let action = match menu_action {
-            MenuAction::OpenGraph => Action::ShowRepoGitGraph(id),
-            MenuAction::Refresh => Action::RefreshRepo(id),
-            MenuAction::CopyPath => Action::CopyPath(id),
-            MenuAction::OpenGitHub => Action::OpenGitHub(id),
-            MenuAction::Commit => Action::StartCommit(id),
-            MenuAction::Push => Action::GitPush(id),
-            MenuAction::Publish => Action::GitPublish(id),
-            MenuAction::CreateGithubPrivate => Action::StartCreateGitHubRepo { id, private: true },
-            MenuAction::CreateGithubPublic => Action::StartCreateGitHubRepo { id, private: false },
-            MenuAction::Pull => Action::GitPull(id),
-            MenuAction::PullRebase => Action::GitPullRebase(id),
-            MenuAction::PullSubmodules => Action::GitPullSubmodules(id),
-            MenuAction::RemoveOriginRemote => Action::RemoveOriginRemote(id),
-            MenuAction::SubmoduleUpdate => Action::GitSubmoduleUpdate(id),
-            MenuAction::SubmoduleSync => Action::GitSubmoduleSync(id),
-            MenuAction::SubmoduleUpdateLatest => Action::GitSubmoduleUpdateLatest(id),
-        };
+        let action = item.action?.into_action(id);
         self.hide();
         Some(action)
     }
@@ -265,17 +316,15 @@ impl Component for ContextMenu {
             return Ok(None);
         }
 
+        if selection::handle_vertical_key_matching(&mut self.state, self.items.len(), key, |idx| {
+            self.items[idx].action.is_some()
+        }) {
+            return Ok(None);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.hide();
-                Ok(None)
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.select_next();
-                Ok(None)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.select_prev();
                 Ok(None)
             }
             KeyCode::Enter => Ok(self.activate_selected()),
@@ -323,45 +372,17 @@ impl Component for ContextMenu {
             .iter()
             .map(|item| {
                 let Some(action) = &item.action else {
-                    return ListItem::new(Line::from(Span::styled(
+                    return ListItem::new(Line::from(bold_fg_span(
                         format!(" {} ", item.label),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
+                        Color::DarkGray,
                     )));
                 };
-                let style = match action {
-                    MenuAction::Push => Style::default().fg(Color::Green),
-                    MenuAction::Commit
-                    | MenuAction::Publish
-                    | MenuAction::CreateGithubPrivate
-                    | MenuAction::CreateGithubPublic => Style::default().fg(Color::Cyan),
-                    MenuAction::Pull | MenuAction::PullRebase | MenuAction::PullSubmodules => {
-                        Style::default().fg(Color::Yellow)
-                    }
-                    MenuAction::RemoveOriginRemote => Style::default().fg(Color::Red),
-                    MenuAction::SubmoduleUpdate
-                    | MenuAction::SubmoduleSync
-                    | MenuAction::SubmoduleUpdateLatest => Style::default().fg(Color::LightMagenta),
-                    _ => Style::default(),
-                };
-                ListItem::new(Line::from(Span::styled(&item.label, style)))
+                ListItem::new(Line::from(Span::styled(item.label.clone(), action.style())))
             })
             .collect();
 
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-
-        frame.render_stateful_widget(list, rect, &mut self.state);
+        let block = panel::plain_block(Color::Cyan);
+        frame.render_stateful_widget(panel::highlighted_list(items, block), rect, &mut self.state);
         Ok(())
     }
 }
@@ -404,11 +425,13 @@ mod tests {
         menu.show(repo_id(), 0, 0, menu_state());
 
         for _ in 0..4 {
-            menu.select_next();
+            menu.handle_key_event(KeyEvent::from(KeyCode::Char('j')))
+                .unwrap();
         }
         assert_eq!(selected_label(&menu), "Push  ↑1");
 
-        menu.select_prev();
+        menu.handle_key_event(KeyEvent::from(KeyCode::Char('k')))
+            .unwrap();
         assert_eq!(selected_label(&menu), "Commit all changes");
     }
 

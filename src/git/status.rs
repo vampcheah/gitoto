@@ -51,7 +51,7 @@ pub(crate) struct FileEntry {
     pub submodule_state: Option<SubmoduleState>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FileStatus {
     Modified,
     Added,
@@ -61,7 +61,7 @@ pub(crate) enum FileStatus {
     Conflicted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SubmoduleState {
     Modified,
     Uninitialized,
@@ -69,17 +69,13 @@ pub(crate) enum SubmoduleState {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct WorktreeEntry {
-    pub name: String,
     pub path: PathBuf,
     pub branch: String,
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) struct SubmoduleInfo {
-    pub name: String,
     pub path: PathBuf,
     pub state: SubmoduleState,
     pub head_oid: Option<String>,
@@ -87,6 +83,26 @@ pub(crate) struct SubmoduleInfo {
 }
 
 impl FileStatus {
+    fn from_git_status(status: git2::Status) -> Option<Self> {
+        if status.is_conflicted() {
+            Some(Self::Conflicted)
+        } else if status.is_index_new() || status.is_wt_new() {
+            if status.is_wt_new() && !status.is_index_new() {
+                Some(Self::Untracked)
+            } else {
+                Some(Self::Added)
+            }
+        } else if status.is_index_deleted() || status.is_wt_deleted() {
+            Some(Self::Deleted)
+        } else if status.is_index_renamed() || status.is_wt_renamed() {
+            Some(Self::Renamed)
+        } else if status.is_index_modified() || status.is_wt_modified() {
+            Some(Self::Modified)
+        } else {
+            None
+        }
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Self::Modified => "M",
@@ -95,6 +111,20 @@ impl FileStatus {
             Self::Renamed => "R",
             Self::Untracked => "?",
             Self::Conflicted => "C",
+        }
+    }
+}
+
+impl SubmoduleState {
+    fn from_git_status(status: SubmoduleStatus) -> Option<Self> {
+        if status.is_wd_uninitialized() {
+            Some(Self::Uninitialized)
+        } else if status.is_wd_wd_modified() || status.contains(SubmoduleStatus::WD_UNTRACKED) {
+            Some(Self::Dirty)
+        } else if status.is_wd_modified() || status.contains(SubmoduleStatus::WD_INDEX_MODIFIED) {
+            Some(Self::Modified)
+        } else {
+            None
         }
     }
 }
@@ -116,7 +146,7 @@ pub(crate) fn query_status_with_untracked(
         false,
         ignore_dirty_subs,
         untracked,
-        &default_github_hosts(),
+        &crate::git::remote::default_github_hosts(),
     )
 }
 
@@ -148,11 +178,7 @@ fn query_status_inner(
     let started = Instant::now();
     let repo = Repository::open(path)?;
 
-    // Branch name
-    let branch = match repo.head() {
-        Ok(reference) => reference.shorthand().unwrap_or("HEAD").to_string(),
-        Err(_) => "(no branch)".to_string(),
-    };
+    let branch = crate::git::current_branch_name(&repo, "(no branch)");
 
     // Only fetch remote-tracking refs when explicitly requested
     let fetch_failed = if fetch {
@@ -167,9 +193,9 @@ fn query_status_inner(
     // Ahead/behind
     let has_upstream = has_upstream(&repo);
     let (ahead, behind) = compute_ahead_behind(&repo);
-    let github_url = github_remote_url(&repo, github_hosts);
+    let github_url = crate::git::remote::github_remote_url(&repo, github_hosts);
     let has_github_remote = github_url.is_some();
-    let has_origin_remote = has_origin_remote(&repo);
+    let has_origin_remote = crate::git::remote::has_origin_remote(&repo);
 
     // File statuses
     let mut opts = StatusOptions::new();
@@ -191,103 +217,16 @@ fn query_status_inner(
         opts.exclude_submodules(true);
     }
 
-    let statuses = repo.statuses(Some(&mut opts))?;
-    let mut files = Vec::new();
-
-    for entry in statuses.iter() {
-        let s = entry.status();
-        let file_path = PathBuf::from(entry.path().unwrap_or(""));
-
-        let file_status = if s.is_conflicted() {
-            FileStatus::Conflicted
-        } else if s.is_index_new() || s.is_wt_new() {
-            if s.is_wt_new() && !s.is_index_new() {
-                FileStatus::Untracked
-            } else {
-                FileStatus::Added
-            }
-        } else if s.is_index_deleted() || s.is_wt_deleted() {
-            FileStatus::Deleted
-        } else if s.is_index_renamed() || s.is_wt_renamed() {
-            FileStatus::Renamed
-        } else if s.is_index_modified() || s.is_wt_modified() {
-            FileStatus::Modified
-        } else {
-            continue;
-        };
-
-        files.push(FileEntry {
-            path: file_path,
-            status: file_status,
-            is_submodule: false,
-            submodule_state: None,
-        });
-    }
-
-    let is_dirty = !files.is_empty();
+    let mut files = collect_file_statuses(&repo, &mut opts)?;
+    let has_regular_changes = !files.is_empty();
 
     // Collect linked worktree details (excludes the main working tree)
     let worktree_info = collect_worktree_info(&repo);
 
     // Detect submodules by checking for .gitmodules
     let has_submodules = path.join(".gitmodules").is_file();
-
-    // Submodule enumeration
-    let mut submodules = Vec::new();
-    let mut has_dirty_submodules = false;
-
-    if has_submodules
-        && !ignore_dirty_subs
-        && let Ok(subs) = repo.submodules()
-    {
-        for sub in &subs {
-            let name = sub.name().unwrap_or("").to_string();
-            let sub_path = PathBuf::from(sub.path());
-            let status = repo
-                .submodule_status(&name, git2::SubmoduleIgnore::Unspecified)
-                .unwrap_or(SubmoduleStatus::empty());
-
-            let state = if status.is_wd_uninitialized() {
-                Some(SubmoduleState::Uninitialized)
-            } else if status.is_wd_wd_modified() || status.contains(SubmoduleStatus::WD_UNTRACKED) {
-                Some(SubmoduleState::Dirty)
-            } else if status.is_wd_modified() || status.contains(SubmoduleStatus::WD_INDEX_MODIFIED)
-            {
-                Some(SubmoduleState::Modified)
-            } else {
-                None
-            };
-
-            if let Some(state) = state {
-                let head_oid = sub.head_id().map(|id| id.to_string());
-                let workdir_oid = sub.workdir_id().map(|id| id.to_string());
-
-                submodules.push(SubmoduleInfo {
-                    name: name.clone(),
-                    path: sub_path.clone(),
-                    state: state.clone(),
-                    head_oid,
-                    workdir_oid,
-                });
-
-                // Cross-reference with files vec
-                if let Some(file_entry) = files.iter_mut().find(|f| f.path == sub_path) {
-                    file_entry.is_submodule = true;
-                    file_entry.submodule_state = Some(state.clone());
-                } else {
-                    // Add synthetic FileEntry for dirty submodules not already in files
-                    files.push(FileEntry {
-                        path: sub_path,
-                        status: FileStatus::Modified,
-                        is_submodule: true,
-                        submodule_state: Some(state),
-                    });
-                }
-
-                has_dirty_submodules = true;
-            }
-        }
-    }
+    let submodules = collect_dirty_submodules(&repo, has_submodules, ignore_dirty_subs, &mut files);
+    let has_dirty_submodules = !submodules.is_empty();
 
     let status = RepoStatus {
         branch,
@@ -295,7 +234,7 @@ fn query_status_inner(
         ahead,
         behind,
         has_upstream,
-        is_dirty: is_dirty || has_dirty_submodules,
+        is_dirty: has_regular_changes || has_dirty_submodules,
         worktree_info,
         has_submodules,
         submodules,
@@ -319,6 +258,71 @@ fn query_status_inner(
     Ok(status)
 }
 
+fn collect_file_statuses(
+    repo: &Repository,
+    opts: &mut StatusOptions,
+) -> color_eyre::Result<Vec<FileEntry>> {
+    Ok(repo
+        .statuses(Some(opts))?
+        .iter()
+        .filter_map(|entry| {
+            Some(FileEntry {
+                path: PathBuf::from(entry.path().unwrap_or("")),
+                status: FileStatus::from_git_status(entry.status())?,
+                is_submodule: false,
+                submodule_state: None,
+            })
+        })
+        .collect())
+}
+
+fn collect_dirty_submodules(
+    repo: &Repository,
+    has_submodules: bool,
+    ignore_dirty_subs: bool,
+    files: &mut Vec<FileEntry>,
+) -> Vec<SubmoduleInfo> {
+    if !has_submodules || ignore_dirty_subs {
+        return Vec::new();
+    }
+    let Ok(subs) = repo.submodules() else {
+        return Vec::new();
+    };
+
+    subs.iter()
+        .filter_map(|sub| {
+            let name = sub.name().unwrap_or("");
+            let sub_path = PathBuf::from(sub.path());
+            let state = SubmoduleState::from_git_status(
+                repo.submodule_status(name, git2::SubmoduleIgnore::Unspecified)
+                    .unwrap_or(SubmoduleStatus::empty()),
+            )?;
+
+            mark_submodule_file(files, sub_path.clone(), state);
+            Some(SubmoduleInfo {
+                path: sub_path,
+                state,
+                head_oid: sub.head_id().map(|id| id.to_string()),
+                workdir_oid: sub.workdir_id().map(|id| id.to_string()),
+            })
+        })
+        .collect()
+}
+
+fn mark_submodule_file(files: &mut Vec<FileEntry>, sub_path: PathBuf, state: SubmoduleState) {
+    if let Some(file_entry) = files.iter_mut().find(|file| file.path == sub_path) {
+        file_entry.is_submodule = true;
+        file_entry.submodule_state = Some(state);
+    } else {
+        files.push(FileEntry {
+            path: sub_path,
+            status: FileStatus::Modified,
+            is_submodule: true,
+            submodule_state: Some(state),
+        });
+    }
+}
+
 pub(crate) fn graph_cache_key(path: &Path) -> color_eyre::Result<String> {
     let repo = Repository::open(path)?;
     Ok(graph_cache_key_from_repo(&repo))
@@ -337,70 +341,54 @@ fn graph_cache_key_from_repo(repo: &Repository) -> String {
         .unwrap_or_else(|| "HEAD:unborn".to_string());
     parts.push(head);
 
-    if let Ok(mut refs) = repo.references() {
-        while let Some(Ok(reference)) = refs.next() {
-            let Some(name) = reference.name() else {
-                continue;
-            };
-            if !(name.starts_with("refs/heads/") || name.starts_with("refs/tags/")) {
-                continue;
-            }
-            let oid = reference
-                .peel_to_commit()
-                .ok()
-                .map(|commit| commit.id())
-                .or_else(|| reference.target());
-            if let Some(oid) = oid {
-                parts.push(format!("{name}:{oid}"));
-            }
-        }
+    parts.extend(ref_cache_parts(repo, |name| {
+        name.starts_with("refs/heads/") || name.starts_with("refs/tags/")
+    }));
+
+    for (name, path) in crate::git::linked_worktrees(repo) {
+        let Ok(wt_repo) = Repository::open(&path) else {
+            continue;
+        };
+        let head = wt_repo
+            .head()
+            .ok()
+            .and_then(|head| {
+                let branch = head.shorthand().unwrap_or("HEAD");
+                head.target()
+                    .map(|oid| format!("worktree:{name}:{branch}:{oid}"))
+            })
+            .unwrap_or_else(|| format!("worktree:{name}:unborn"));
+        parts.push(head);
     }
 
-    if let Ok(wt_names) = repo.worktrees() {
-        for name in wt_names.iter().flatten() {
-            let Ok(wt) = repo.find_worktree(name) else {
-                continue;
-            };
-            let Ok(wt_repo) = Repository::open(wt.path()) else {
-                continue;
-            };
-            let head = wt_repo
-                .head()
-                .ok()
-                .and_then(|head| {
-                    let branch = head.shorthand().unwrap_or("HEAD");
-                    head.target()
-                        .map(|oid| format!("worktree:{name}:{branch}:{oid}"))
-                })
-                .unwrap_or_else(|| format!("worktree:{name}:unborn"));
-            parts.push(head);
-        }
-    }
-
-    parts.sort_unstable();
-    parts.join("|")
+    sorted_cache_key(parts)
 }
 
 fn remote_cache_key_from_repo(repo: &Repository) -> String {
+    sorted_cache_key(ref_cache_parts(repo, |name| {
+        name.starts_with("refs/remotes/")
+    }))
+}
+
+fn ref_cache_parts(repo: &Repository, include: impl Fn(&str) -> bool) -> Vec<String> {
     let mut parts = Vec::new();
     if let Ok(mut refs) = repo.references() {
         while let Some(Ok(reference)) = refs.next() {
             let Some(name) = reference.name() else {
                 continue;
             };
-            if !name.starts_with("refs/remotes/") {
+            if !include(name) {
                 continue;
             }
-            let oid = reference
-                .peel_to_commit()
-                .ok()
-                .map(|commit| commit.id())
-                .or_else(|| reference.target());
-            if let Some(oid) = oid {
+            if let Some(oid) = crate::git::reference_oid(&reference) {
                 parts.push(format!("{name}:{oid}"));
             }
         }
     }
+    parts
+}
+
+fn sorted_cache_key(mut parts: Vec<String>) -> String {
     parts.sort_unstable();
     parts.join("|")
 }
@@ -417,124 +405,19 @@ fn has_upstream(repo: &Repository) -> bool {
         .is_ok()
 }
 
-fn github_remote_url(repo: &Repository, hosts: &[String]) -> Option<String> {
-    let Ok(remotes) = repo.remotes() else {
-        return None;
-    };
-
-    remotes.iter().flatten().find_map(|name| {
-        repo.find_remote(name).ok().and_then(|remote| {
-            remote
-                .url()
-                .and_then(|url| github_web_url_from_remote(url, hosts))
-                .or_else(|| {
-                    remote
-                        .pushurl()
-                        .and_then(|url| github_web_url_from_remote(url, hosts))
-                })
-        })
-    })
-}
-
-fn has_origin_remote(repo: &Repository) -> bool {
-    repo.find_remote("origin").is_ok()
-}
-
-#[cfg(test)]
-fn default_github_hosts() -> Vec<String> {
-    vec!["github.com".to_string()]
-}
-
-fn github_web_url_from_remote(url: &str, hosts: &[String]) -> Option<String> {
-    let trimmed = url.trim();
-    let (host, path) = split_git_remote(trimmed)?;
-    if !hosts.iter().any(|allowed| same_host(allowed, host)) {
-        return None;
-    }
-
-    let path = path
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(path)
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
-    let mut parts = path.split('/');
-    let owner = parts.next().filter(|part| !part.is_empty())?;
-    let repo = parts.next().filter(|part| !part.is_empty())?;
-    Some(format!("https://{host}/{owner}/{repo}"))
-}
-
-fn split_git_remote(url: &str) -> Option<(&str, &str)> {
-    for scheme in ["git+ssh://", "ssh://", "https://", "http://"] {
-        if let Some(rest) = url.strip_prefix(scheme) {
-            let rest = rest
-                .rsplit_once('@')
-                .map(|(_, value)| value)
-                .unwrap_or(rest);
-            let (authority, path) = rest.split_once('/')?;
-            let host = authority
-                .split_once(':')
-                .map(|(host, _port)| host)
-                .unwrap_or(authority);
-            return Some((host, path));
-        }
-    }
-
-    if let Some(rest) = url.strip_prefix("git@") {
-        return rest.split_once(':');
-    }
-
-    url.split_once(':')
-}
-
-fn same_host(allowed: &str, actual: &str) -> bool {
-    normalize_host(allowed).eq_ignore_ascii_case(normalize_host(actual))
-}
-
-fn normalize_host(host: &str) -> &str {
-    let normalized = host
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_end_matches('/');
-    normalized
-        .split_once(':')
-        .map(|(host, _port)| host)
-        .unwrap_or(normalized)
-}
-
 /// Collect details for each linked worktree using the git2 API.
 /// Mirrors the pattern in `git/graph.rs::collect_worktree_branches`.
 fn collect_worktree_info(repo: &Repository) -> Vec<WorktreeEntry> {
-    let wt_names = match repo.worktrees() {
-        Ok(names) => names,
-        Err(_) => return Vec::new(),
-    };
-    let mut entries = Vec::new();
-    for i in 0..wt_names.len() {
-        let name = match wt_names.get(i) {
-            Some(n) => n,
-            None => continue,
-        };
-        let wt = match repo.find_worktree(name) {
-            Ok(wt) => wt,
-            Err(_) => continue,
-        };
-        let wt_path = wt.path().to_path_buf();
-        let branch = match Repository::open(&wt_path) {
-            Ok(wt_repo) => match wt_repo.head() {
-                Ok(head) => head.shorthand().unwrap_or("HEAD").to_string(),
-                Err(_) => "(no branch)".to_string(),
-            },
-            Err(_) => continue,
-        };
-        entries.push(WorktreeEntry {
-            name: name.to_string(),
-            path: wt_path,
-            branch,
-        });
-    }
-    entries
+    crate::git::linked_worktrees(repo)
+        .into_iter()
+        .filter_map(|(_, wt_path)| {
+            let wt_repo = Repository::open(&wt_path).ok()?;
+            Some(WorktreeEntry {
+                path: wt_path,
+                branch: crate::git::current_branch_name(&wt_repo, "(no branch)"),
+            })
+        })
+        .collect()
 }
 
 /// Run `git fetch` with a 30-second timeout to update remote-tracking refs.
@@ -543,15 +426,11 @@ fn collect_worktree_info(repo: &Repository) -> Vec<WorktreeEntry> {
 fn fetch_remote_silent(path: &Path) -> bool {
     use wait_timeout::ChildExt;
 
-    let child = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("fetch")
-        .arg("--quiet")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "true")
-        .env("GCM_INTERACTIVE", "never")
-        .stdin(std::process::Stdio::null())
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(path).args(["fetch", "--quiet"]);
+    crate::git::configure_noninteractive(&mut command);
+
+    let child = command
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
@@ -612,28 +491,36 @@ fn compute_ahead_behind(repo: &Repository) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::test_support;
     use std::fs;
     use tempfile::TempDir;
 
-    fn init_temp_repo() -> (TempDir, Repository) {
-        let tmp = TempDir::new().unwrap();
-        let repo = Repository::init(tmp.path()).unwrap();
+    fn has_file_status(status: &RepoStatus, file_status: FileStatus) -> bool {
+        status.files.iter().any(|f| f.status == file_status)
+    }
 
-        // Create initial commit so HEAD exists
-        {
-            let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-            let tree_id = repo.index().unwrap().write_tree().unwrap();
-            let tree = repo.find_tree(tree_id).unwrap();
-            repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-                .unwrap();
-        }
+    fn assert_no_dirty_submodules(status: &RepoStatus) {
+        assert!(!status.has_dirty_submodules);
+        assert!(status.submodules.is_empty());
+    }
 
-        (tmp, repo)
+    fn assert_clean_submodule_status(status: &RepoStatus) {
+        assert!(status.has_submodules);
+        assert_no_dirty_submodules(status);
+        assert!(!status.files.iter().any(|f| f.is_submodule));
+    }
+
+    fn assert_submodule_state(status: &RepoStatus, state: SubmoduleState) {
+        assert!(status.has_submodules);
+        assert!(status.has_dirty_submodules);
+        let sub_info = &status.submodules[0];
+        assert_eq!(sub_info.path, Path::new("my-sub"));
+        assert_eq!(sub_info.state, state);
     }
 
     #[test]
     fn test_clean_repo_reports_no_changes() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         let status = query_status(tmp.path(), false).unwrap();
         assert!(!status.is_dirty);
         assert!(status.files.is_empty());
@@ -643,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_github_remote_detected() {
-        let (tmp, repo) = init_temp_repo();
+        let (tmp, repo) = test_support::init_repo_with_commit();
         repo.remote("origin", "git@github.com:owner/repo.git")
             .unwrap();
 
@@ -658,310 +545,150 @@ mod tests {
     }
 
     #[test]
-    fn test_github_remote_url_parsing() {
-        let hosts = default_github_hosts();
-        assert_eq!(
-            github_web_url_from_remote("git@github.com:owner/repo.git", &hosts).as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("https://github.com/owner/repo.git", &hosts).as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("ssh://git@github.com/owner/repo.git", &hosts).as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("git+ssh://git@github.com/owner/repo.git", &hosts)
-                .as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("ssh://deploy@github.com:22/owner/repo.git", &hosts)
-                .as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("github.com:owner/repo.git", &hosts).as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("git@example.com:owner/repo.git", &hosts),
-            None
-        );
-    }
-
-    #[test]
-    fn test_github_enterprise_remote_url_parsing() {
-        let hosts = vec!["git.example.com".to_string()];
-        assert_eq!(
-            github_web_url_from_remote("git@git.example.com:team/repo.git", &hosts).as_deref(),
-            Some("https://git.example.com/team/repo")
-        );
-        assert_eq!(
-            github_web_url_from_remote("https://github.com/team/repo.git", &hosts),
-            None
-        );
-    }
-
-    #[test]
     fn test_modified_file_detected() {
-        let (tmp, repo) = init_temp_repo();
+        let (tmp, repo) = test_support::init_repo_with_commit();
 
-        // Add and commit a file
-        let file_path = tmp.path().join("test.txt");
-        fs::write(&file_path, "hello").unwrap();
-        let mut index = repo.index().unwrap();
-        index.add_path(Path::new("test.txt")).unwrap();
-        index.write().unwrap();
-        let tree_id = index.write_tree().unwrap();
-        let tree = repo.find_tree(tree_id).unwrap();
         let head = repo.head().unwrap().peel_to_commit().unwrap();
-        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "Add file", &tree, &[&head])
-            .unwrap();
+        test_support::write_commit(&repo, tmp.path(), "test.txt", "hello", "Add file", &[&head]);
 
         // Modify it
-        fs::write(&file_path, "world").unwrap();
+        fs::write(tmp.path().join("test.txt"), "world").unwrap();
 
         let status = query_status(tmp.path(), false).unwrap();
         assert!(status.is_dirty);
-        assert!(
-            status
-                .files
-                .iter()
-                .any(|f| f.status == FileStatus::Modified)
-        );
+        assert!(has_file_status(&status, FileStatus::Modified));
     }
 
     #[test]
     fn test_untracked_file_detected() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         fs::write(tmp.path().join("new.txt"), "new").unwrap();
 
         let status = query_status(tmp.path(), false).unwrap();
         assert!(status.is_dirty);
-        assert!(
-            status
-                .files
-                .iter()
-                .any(|f| f.status == FileStatus::Untracked)
-        );
+        assert!(has_file_status(&status, FileStatus::Untracked));
     }
 
     #[test]
     fn test_worktree_info_empty_for_plain_repo() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         let status = query_status(tmp.path(), false).unwrap();
         assert!(status.worktree_info.is_empty());
     }
 
     #[test]
     fn test_worktree_info_reflects_linked_worktrees() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         // Create a linked worktree via git CLI
         let wt_dir = tmp.path().join("wt1");
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .arg("worktree")
-            .arg("add")
-            .arg(&wt_dir)
-            .arg("-b")
-            .arg("wt-branch")
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "git worktree add failed");
+        let wt_dir = wt_dir.to_string_lossy();
+        test_support::git_ok(
+            tmp.path(),
+            &["worktree", "add", &wt_dir, "-b", "wt-branch"],
+            "git worktree add",
+        );
 
         let status = query_status(tmp.path(), false).unwrap();
         assert_eq!(status.worktree_info.len(), 1);
         assert_eq!(status.worktree_info[0].branch, "wt-branch");
-        assert_eq!(status.worktree_info[0].name, "wt1");
     }
 
     #[test]
     fn test_submodule_state_mapping() {
-        // Test the flag-to-state conversion logic
-        let flags = SubmoduleStatus::WD_UNINITIALIZED;
-        assert!(flags.is_wd_uninitialized());
-
-        let flags = SubmoduleStatus::WD_WD_MODIFIED;
-        assert!(flags.is_wd_wd_modified());
-
-        let flags = SubmoduleStatus::WD_UNTRACKED;
-        assert!(flags.contains(SubmoduleStatus::WD_UNTRACKED));
-
-        let flags = SubmoduleStatus::WD_MODIFIED;
-        assert!(flags.is_wd_modified());
-
-        let flags = SubmoduleStatus::WD_INDEX_MODIFIED;
-        assert!(flags.contains(SubmoduleStatus::WD_INDEX_MODIFIED));
+        for (git_status, state) in [
+            (
+                SubmoduleStatus::WD_UNINITIALIZED,
+                SubmoduleState::Uninitialized,
+            ),
+            (SubmoduleStatus::WD_WD_MODIFIED, SubmoduleState::Dirty),
+            (SubmoduleStatus::WD_UNTRACKED, SubmoduleState::Dirty),
+            (SubmoduleStatus::WD_MODIFIED, SubmoduleState::Modified),
+            (SubmoduleStatus::WD_INDEX_MODIFIED, SubmoduleState::Modified),
+            (
+                SubmoduleStatus::WD_UNINITIALIZED | SubmoduleStatus::WD_MODIFIED,
+                SubmoduleState::Uninitialized,
+            ),
+            (
+                SubmoduleStatus::WD_WD_MODIFIED | SubmoduleStatus::WD_MODIFIED,
+                SubmoduleState::Dirty,
+            ),
+        ] {
+            assert_eq!(SubmoduleState::from_git_status(git_status), Some(state));
+        }
     }
 
     #[test]
     fn test_clean_repo_no_dirty_submodules() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         let status = query_status(tmp.path(), false).unwrap();
-        assert!(!status.has_dirty_submodules);
-        assert!(status.submodules.is_empty());
+        assert_no_dirty_submodules(&status);
     }
 
     #[test]
     fn test_status_maps_correctly() {
-        assert_eq!(FileStatus::Modified.label(), "M");
-        assert_eq!(FileStatus::Added.label(), "A");
-        assert_eq!(FileStatus::Deleted.label(), "D");
-        assert_eq!(FileStatus::Renamed.label(), "R");
-        assert_eq!(FileStatus::Untracked.label(), "?");
-        assert_eq!(FileStatus::Conflicted.label(), "C");
-    }
-
-    #[test]
-    fn test_file_entry_submodule_fields() {
-        let entry = FileEntry {
-            path: PathBuf::from("my-submodule"),
-            status: FileStatus::Modified,
-            is_submodule: true,
-            submodule_state: Some(SubmoduleState::Modified),
-        };
-        assert!(entry.is_submodule);
-        assert_eq!(entry.submodule_state, Some(SubmoduleState::Modified));
-
-        let plain = FileEntry {
-            path: PathBuf::from("src/main.rs"),
-            status: FileStatus::Modified,
-            is_submodule: false,
-            submodule_state: None,
-        };
-        assert!(!plain.is_submodule);
-        assert_eq!(plain.submodule_state, None);
-    }
-
-    #[test]
-    fn test_submodule_state_equality_and_clone() {
-        assert_eq!(SubmoduleState::Modified, SubmoduleState::Modified);
-        assert_eq!(SubmoduleState::Dirty, SubmoduleState::Dirty);
-        assert_eq!(SubmoduleState::Uninitialized, SubmoduleState::Uninitialized);
-        assert_ne!(SubmoduleState::Modified, SubmoduleState::Dirty);
-        assert_ne!(SubmoduleState::Dirty, SubmoduleState::Uninitialized);
-
-        let state = SubmoduleState::Modified;
-        let cloned = state.clone();
-        assert_eq!(state, cloned);
+        for (status, label) in [
+            (FileStatus::Modified, "M"),
+            (FileStatus::Added, "A"),
+            (FileStatus::Deleted, "D"),
+            (FileStatus::Renamed, "R"),
+            (FileStatus::Untracked, "?"),
+            (FileStatus::Conflicted, "C"),
+        ] {
+            assert_eq!(status.label(), label);
+        }
     }
 
     #[test]
     fn test_ignore_dirty_subs_on_clean_repo() {
         // ignore_dirty_subs = true should work fine on repos without submodules
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         let status = query_status(tmp.path(), true).unwrap();
         assert!(!status.is_dirty);
         assert!(status.files.is_empty());
-        assert!(status.submodules.is_empty());
-        assert!(!status.has_dirty_submodules);
+        assert_no_dirty_submodules(&status);
     }
 
     #[test]
     fn test_ignore_dirty_subs_still_detects_regular_changes() {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
         fs::write(tmp.path().join("new.txt"), "new").unwrap();
 
         let status = query_status(tmp.path(), true).unwrap();
         assert!(status.is_dirty);
-        assert!(
-            status
-                .files
-                .iter()
-                .any(|f| f.status == FileStatus::Untracked)
-        );
-        // Submodule fields should be empty when ignored
-        assert!(status.submodules.is_empty());
-        assert!(!status.has_dirty_submodules);
-    }
-
-    #[test]
-    fn test_submodule_state_priority_uninitialized_first() {
-        // WD_UNINITIALIZED takes priority over other flags
-        let flags = SubmoduleStatus::WD_UNINITIALIZED | SubmoduleStatus::WD_MODIFIED;
-        assert!(flags.is_wd_uninitialized());
-    }
-
-    #[test]
-    fn test_submodule_state_priority_dirty_over_modified() {
-        // WD_WD_MODIFIED (dirty) is checked before WD_MODIFIED (pointer change)
-        let flags = SubmoduleStatus::WD_WD_MODIFIED | SubmoduleStatus::WD_MODIFIED;
-        assert!(flags.is_wd_wd_modified());
-        assert!(flags.is_wd_modified());
-        // Our mapping logic checks dirty first, so this should map to Dirty
+        assert!(has_file_status(&status, FileStatus::Untracked));
+        assert_no_dirty_submodules(&status);
     }
 
     /// Helper: creates a temp repo with a submodule, returns (parent_tmp, sub_source_tmp, sub_repo)
     fn init_repo_with_submodule() -> (TempDir, TempDir, Repository) {
-        let (tmp, _repo) = init_temp_repo();
+        let (tmp, _repo) = test_support::init_repo_with_commit();
 
-        let sub_source = TempDir::new().unwrap();
-        let sub_repo = Repository::init(sub_source.path()).unwrap();
-        {
-            let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-            fs::write(sub_source.path().join("lib.rs"), "fn hello() {}").unwrap();
-            let mut idx = sub_repo.index().unwrap();
-            idx.add_path(Path::new("lib.rs")).unwrap();
-            idx.write().unwrap();
-            let tree_id = idx.write_tree().unwrap();
-            let tree = sub_repo.find_tree(tree_id).unwrap();
-            sub_repo
-                .commit(Some("HEAD"), &sig, &sig, "init sub", &tree, &[])
-                .unwrap();
-        }
+        let (sub_source, sub_repo) = test_support::init_repo();
+        test_support::write_commit(
+            &sub_repo,
+            sub_source.path(),
+            "lib.rs",
+            "fn hello() {}",
+            "init sub",
+            &[],
+        );
 
         // Add submodule (requires protocol.file.allow for local paths)
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args([
+        test_support::git_ok(
+            tmp.path(),
+            &[
                 "-c",
                 "protocol.file.allow=always",
                 "submodule",
                 "add",
                 sub_source.path().to_str().unwrap(),
                 "my-sub",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git submodule add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            ],
+            "git submodule add",
         );
 
-        // Commit the submodule addition (use -c user.* for CI environments without global git config)
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(["add", "."])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args([
-                "-c",
-                "user.name=Test",
-                "-c",
-                "user.email=test@test.com",
-                "commit",
-                "-m",
-                "add submodule",
-            ])
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        test_support::git_ok(tmp.path(), &["add", "."], "git add submodule files");
+        test_support::git_commit(tmp.path(), "add submodule");
 
         (tmp, sub_source, sub_repo)
     }
@@ -972,22 +699,14 @@ mod tests {
 
         // Verify: clean state should show has_submodules but no dirty submodules
         let status = query_status(tmp.path(), false).unwrap();
-        assert!(status.has_submodules);
-        assert!(!status.has_dirty_submodules);
-        assert!(status.submodules.is_empty());
+        assert_clean_submodule_status(&status);
 
         // Now make the submodule dirty by modifying a file inside it
         let sub_workdir = tmp.path().join("my-sub");
         fs::write(sub_workdir.join("lib.rs"), "fn hello() { /* changed */ }").unwrap();
 
         let status = query_status(tmp.path(), false).unwrap();
-        assert!(status.has_submodules);
-        assert!(status.has_dirty_submodules);
-        assert!(!status.submodules.is_empty());
-
-        let sub_info = &status.submodules[0];
-        assert_eq!(sub_info.path, Path::new("my-sub"));
-        assert_eq!(sub_info.state, SubmoduleState::Dirty);
+        assert_submodule_state(&status, SubmoduleState::Dirty);
 
         // Verify the file entry is annotated
         let file_entry = status.files.iter().find(|f| f.path == Path::new("my-sub"));
@@ -1006,11 +725,7 @@ mod tests {
 
         // With ignore_dirty_subs = true, submodule state should be hidden
         let status = query_status(tmp.path(), true).unwrap();
-        assert!(status.has_submodules); // .gitmodules still exists
-        assert!(!status.has_dirty_submodules);
-        assert!(status.submodules.is_empty());
-        // No submodule-annotated entries
-        assert!(!status.files.iter().any(|f| f.is_submodule));
+        assert_clean_submodule_status(&status);
     }
 
     #[test]
@@ -1019,48 +734,36 @@ mod tests {
 
         // Add a new commit to the submodule source
         {
-            let sig = git2::Signature::now("Test", "test@test.com").unwrap();
-            fs::write(_sub_source.path().join("lib.rs"), "v2").unwrap();
-            let mut idx = sub_repo.index().unwrap();
-            idx.add_path(Path::new("lib.rs")).unwrap();
-            idx.write().unwrap();
-            let tree_id = idx.write_tree().unwrap();
-            let tree = sub_repo.find_tree(tree_id).unwrap();
+            test_support::write_and_stage(&sub_repo, _sub_source.path(), "lib.rs", "v2");
             let head = sub_repo.head().unwrap().peel_to_commit().unwrap();
-            sub_repo
-                .commit(Some("HEAD"), &sig, &sig, "v2", &tree, &[&head])
-                .unwrap();
+            test_support::commit(&sub_repo, "v2", &[&head]);
         }
 
         // Pull the new commit inside the submodule workdir
-        let output = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path().join("my-sub"))
-            .args([
+        let submodule_path = tmp.path().join("my-sub");
+        let output = test_support::git(
+            &submodule_path,
+            &[
                 "-c",
                 "protocol.file.allow=always",
                 "pull",
                 "origin",
                 "master",
-            ])
-            .output()
-            .unwrap();
+            ],
+        );
         // Try main if master fails
         if !output.status.success() {
-            let _ = std::process::Command::new("git")
-                .arg("-C")
-                .arg(tmp.path().join("my-sub"))
-                .args(["-c", "protocol.file.allow=always", "pull", "origin", "main"])
-                .output();
+            let _ = test_support::git(
+                &submodule_path,
+                &["-c", "protocol.file.allow=always", "pull", "origin", "main"],
+            );
         }
 
         // Now the submodule pointer has changed (HEAD in submodule != recorded in parent)
         let status = query_status(tmp.path(), false).unwrap();
+        let sub_info = &status.submodules[0];
         assert!(status.has_submodules);
         assert!(status.has_dirty_submodules);
-        assert!(!status.submodules.is_empty());
-
-        let sub_info = &status.submodules[0];
         assert_eq!(sub_info.path, Path::new("my-sub"));
         // Could be Modified or Dirty depending on exact git state
         assert!(
@@ -1081,10 +784,7 @@ mod tests {
 
         // Without any modifications, the submodule should be clean
         let status = query_status(tmp.path(), false).unwrap();
-        assert!(status.has_submodules);
-        assert!(!status.has_dirty_submodules);
-        assert!(status.submodules.is_empty());
-        assert!(!status.files.iter().any(|f| f.is_submodule));
+        assert_clean_submodule_status(&status);
     }
 
     #[test]

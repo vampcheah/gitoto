@@ -1,13 +1,46 @@
 pub(crate) mod commit_files;
 pub(crate) mod graph;
 pub(crate) mod graph_render;
+pub(crate) mod remote;
 pub(crate) mod scanner;
 pub(crate) mod status;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use color_eyre::eyre::{Context, Result, eyre};
 use git2::Repository;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+pub(crate) fn current_branch_name(repo: &Repository, fallback: &str) -> String {
+    repo.head()
+        .ok()
+        .and_then(|reference| reference.shorthand().map(str::to_string))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+pub(crate) fn reference_oid(reference: &git2::Reference<'_>) -> Option<git2::Oid> {
+    reference
+        .peel_to_commit()
+        .ok()
+        .map(|commit| commit.id())
+        .or_else(|| reference.target())
+}
+
+pub(crate) fn linked_worktrees(repo: &Repository) -> Vec<(String, PathBuf)> {
+    let Ok(names) = repo.worktrees() else {
+        return Vec::new();
+    };
+
+    names
+        .iter()
+        .flatten()
+        .filter_map(|name| {
+            let path = repo.find_worktree(name).ok()?.path().to_path_buf();
+            Some((name.to_string(), path))
+        })
+        .collect()
+}
 
 pub(crate) fn commit_all(repo_path: &Path, message: &str, no_verify: bool) -> Result<String> {
     if message.trim().is_empty() {
@@ -97,6 +130,24 @@ fn run_git(repo_path: &Path, args: &[&str]) -> Result<String> {
     command_output_to_result(&format!("git {}", args.join(" ")), output)
 }
 
+pub(crate) fn git_stdout(repo_path: &Path, args: &[&str]) -> std::io::Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_path).args(args);
+    configure_noninteractive(&mut command);
+    command_stdout(command)
+}
+
+pub(crate) fn git_stdout_with_path(
+    repo_path: &Path,
+    args: &[&str],
+    path: &Path,
+) -> std::io::Result<String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_path).args(args).arg(path);
+    configure_noninteractive(&mut command);
+    command_stdout(command)
+}
+
 pub(crate) fn run_git_args(repo_path: &Path, args: &[String]) -> Result<String> {
     let command = format!("git {}", args.join(" "));
     let mut child = Command::new("git");
@@ -138,6 +189,12 @@ fn command_output_to_result(command: &str, output: std::process::Output) -> Resu
         command,
         explain_git_failure(&message)
     ))
+}
+
+fn command_stdout(mut command: Command) -> std::io::Result<String> {
+    command
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn explain_git_failure(message: &str) -> String {

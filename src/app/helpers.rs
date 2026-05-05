@@ -144,6 +144,14 @@ pub(super) fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+pub(super) fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+
+    let encoded = base64_encode(text.as_bytes());
+    let _ = write!(std::io::stdout(), "\x1b]52;c;{}\x1b\\", encoded);
+    let _ = std::io::stdout().flush();
+}
+
 pub(super) fn is_valid_github_repo_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')

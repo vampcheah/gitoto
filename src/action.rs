@@ -3,14 +3,10 @@ use crate::git::status::RepoStatus;
 use crate::repo_id::RepoId;
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum Action {
     Tick,
-    Render,
     Quit,
     Resize(u16, u16),
-    SelectNextRepo,
-    SelectPrevRepo,
     SelectRepo(RepoId),
     SelectWorktree {
         repo_id: RepoId,
@@ -38,7 +34,6 @@ pub(crate) enum Action {
     PollFetch,
     ShowGitGraph,
     ShowRepoGitGraph(RepoId),
-    ShowFileList,
     GraphLoaded {
         generation: u64,
         rows: Vec<GraphRow>,
@@ -60,7 +55,6 @@ pub(crate) enum Action {
     CopyPath(RepoId),
     OpenGitHub(RepoId),
     StartCommit(RepoId),
-    UpdateCommitMessage(String),
     ConfirmCommit,
     CancelCommit,
     GitPush(RepoId),
@@ -69,7 +63,6 @@ pub(crate) enum Action {
         id: RepoId,
         private: bool,
     },
-    UpdateGitHubRepoName(String),
     ConfirmCreateGitHubRepo,
     CancelCreateGitHubRepo,
     CreateGitHubRepo {

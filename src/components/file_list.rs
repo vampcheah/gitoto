@@ -2,16 +2,22 @@ use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    layout::{Constraint, Rect},
+    style::Color,
+    widgets::{ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::action::Action;
 use crate::components::Component;
-use crate::git::status::{FileEntry, FileStatus, SubmoduleState};
+use crate::components::diff_view;
+use crate::components::file_status_view;
+use crate::components::layout;
+use crate::components::panel;
+use crate::components::scroll;
+use crate::components::selection;
+use crate::components::style::fg_style;
+use crate::git::status::FileEntry;
 use crate::repo_id::RepoId;
 
 pub(crate) struct FileList {
@@ -62,47 +68,21 @@ impl FileList {
 
         if files_changed {
             self.diff_content = None;
-            self.diff_scroll = 0;
+            scroll::reset(&mut self.diff_scroll);
         }
 
         if self.files.is_empty() {
             self.state.select(None);
         } else if is_same_repo {
-            // Preserve selection on refresh
-            let idx = prev_selected
-                .map(|i| i.min(self.files.len() - 1))
-                .unwrap_or(0);
-            self.state.select(Some(idx));
+            selection::preserve_or_first(&mut self.state, prev_selected, self.files.len());
         } else {
-            self.state.select(Some(0));
+            selection::select_first(&mut self.state, self.files.len());
         }
     }
 
     pub fn set_diff(&mut self, content: String) {
         self.diff_content = Some(content);
-        self.diff_scroll = 0;
-    }
-
-    fn select_next(&mut self) {
-        if self.files.is_empty() {
-            return;
-        }
-        let i = match self.state.selected() {
-            Some(i) => (i + 1).min(self.files.len() - 1),
-            None => 0,
-        };
-        self.state.select(Some(i));
-    }
-
-    fn select_prev(&mut self) {
-        if self.files.is_empty() {
-            return;
-        }
-        let i = match self.state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
-        self.state.select(Some(i));
+        scroll::reset(&mut self.diff_scroll);
     }
 
     pub fn viewing_diff(&self) -> bool {
@@ -140,10 +120,7 @@ impl FileList {
             format!(" Changes — {} ", self.repo_name)
         };
 
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
+        let block = panel::bordered_block(title, border_color);
 
         if self.files.is_empty() {
             let msg = if self.repo_name.is_empty() {
@@ -152,7 +129,7 @@ impl FileList {
                 "No changes"
             };
             let paragraph = Paragraph::new(msg)
-                .style(Style::default().fg(Color::DarkGray))
+                .style(fg_style(Color::DarkGray))
                 .block(block);
             frame.render_widget(paragraph, area);
             return;
@@ -161,55 +138,10 @@ impl FileList {
         let items: Vec<ListItem> = self
             .files
             .iter()
-            .map(|entry| {
-                let color = match entry.status {
-                    FileStatus::Modified => Color::Yellow,
-                    FileStatus::Added => Color::Green,
-                    FileStatus::Deleted => Color::Red,
-                    FileStatus::Renamed => Color::Blue,
-                    FileStatus::Untracked => Color::DarkGray,
-                    FileStatus::Conflicted => Color::LightRed,
-                };
-
-                let mut spans = vec![Span::styled(
-                    format!(" {} ", entry.status.label()),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )];
-
-                if entry.is_submodule {
-                    let sub_label = match &entry.submodule_state {
-                        Some(SubmoduleState::Modified) => "[sub: +commit] ",
-                        Some(SubmoduleState::Uninitialized) => "[sub: -uninit] ",
-                        Some(SubmoduleState::Dirty) => "[sub: ~dirty] ",
-                        None => "[submodule] ",
-                    };
-                    spans.push(Span::styled(
-                        sub_label,
-                        Style::default().fg(Color::LightMagenta),
-                    ));
-                }
-
-                let path_color = if entry.is_submodule {
-                    Color::LightMagenta
-                } else {
-                    Color::White
-                };
-                spans.push(Span::styled(
-                    entry.path.to_string_lossy().to_string(),
-                    Style::default().fg(path_color),
-                ));
-
-                ListItem::new(Line::from(spans))
-            })
+            .map(file_status_view::worktree_file_item)
             .collect();
 
-        let list = List::new(items).block(block).highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-
-        frame.render_stateful_widget(list, area, &mut self.state);
+        frame.render_stateful_widget(panel::highlighted_list(items, block), area, &mut self.state);
     }
 
     fn draw_diff(&self, frame: &mut Frame, area: Rect) {
@@ -217,36 +149,13 @@ impl FileList {
             return;
         };
 
-        let title = format!(" Diff — {} (Esc/h to close) ", self.repo_name);
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
-
-        let lines: Vec<Line> = content
-            .lines()
-            .map(|line| {
-                let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    Style::default().fg(Color::Green)
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    Style::default().fg(Color::Red)
-                } else if line.starts_with("@@") {
-                    Style::default().fg(Color::Cyan)
-                } else if line.starts_with("diff ") || line.starts_with("index ") {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                Line::from(Span::styled(line, style))
-            })
-            .collect();
-
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((self.diff_scroll, 0));
-
-        frame.render_widget(paragraph, area);
+        diff_view::render_diff(
+            frame,
+            area,
+            format!(" Diff — {} (Esc/h to close) ", self.repo_name),
+            content,
+            self.diff_scroll,
+        );
     }
 }
 
@@ -261,28 +170,16 @@ impl Component for FileList {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('h') | KeyCode::Left => {
                     self.diff_content = None;
-                    self.diff_scroll = 0;
+                    scroll::reset(&mut self.diff_scroll);
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.diff_scroll = self.diff_scroll.saturating_add(1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.diff_scroll = self.diff_scroll.saturating_sub(1);
-                }
+                _ if scroll::handle_vertical_key(&mut self.diff_scroll, key) => {}
                 _ => {}
             }
             return Ok(None);
         }
 
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.select_next();
-                Ok(None)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.select_prev();
-                Ok(None)
-            }
+            _ if selection::handle_vertical_key(&mut self.state, self.files.len(), key) => Ok(None),
             KeyCode::Enter => Ok(self.try_show_diff()),
             _ => Ok(None),
         }
@@ -291,8 +188,6 @@ impl Component for FileList {
     fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<Option<Action>> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-
                 // In split mode, clicks in file_list_area select files
                 let click_area = if self.viewing_diff() {
                     self.file_list_area
@@ -300,19 +195,17 @@ impl Component for FileList {
                     self.render_area
                 };
 
-                if click_area.contains(pos) {
-                    let content_y = click_area.y + 1; // +1 for border
-                    if mouse.row >= content_y {
-                        let visual_row = (mouse.row - content_y) as usize;
-                        let idx = visual_row + self.state.offset();
-                        if idx < self.files.len() {
-                            // Click on already-selected row opens diff
-                            if self.state.selected() == Some(idx) {
-                                return Ok(self.try_show_diff());
-                            }
-                            self.state.select(Some(idx));
-                        }
+                if let Some(idx) = selection::clicked_list_index(
+                    click_area,
+                    mouse.column,
+                    mouse.row,
+                    self.state.offset(),
+                    self.files.len(),
+                ) {
+                    if self.state.selected() == Some(idx) {
+                        return Ok(self.try_show_diff());
                     }
+                    self.state.select(Some(idx));
                 }
                 Ok(None)
             }
@@ -320,12 +213,12 @@ impl Component for FileList {
                 if self.viewing_diff() {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if self.diff_area.contains(pos) {
-                        self.diff_scroll = self.diff_scroll.saturating_sub(1);
+                        scroll::up(&mut self.diff_scroll);
                     } else {
-                        self.select_prev();
+                        selection::select_prev(&mut self.state, self.files.len());
                     }
                 } else {
-                    self.select_prev();
+                    selection::select_prev(&mut self.state, self.files.len());
                 }
                 Ok(None)
             }
@@ -333,12 +226,12 @@ impl Component for FileList {
                 if self.viewing_diff() {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if self.diff_area.contains(pos) {
-                        self.diff_scroll = self.diff_scroll.saturating_add(1);
+                        scroll::down(&mut self.diff_scroll);
                     } else {
-                        self.select_next();
+                        selection::select_next(&mut self.state, self.files.len());
                     }
                 } else {
-                    self.select_next();
+                    selection::select_next(&mut self.state, self.files.len());
                 }
                 Ok(None)
             }
@@ -351,15 +244,11 @@ impl Component for FileList {
 
         if self.diff_content.is_some() {
             // Split: file list 40% | diff 60%
-            let dir = if self.horizontal_layout {
-                Direction::Vertical
-            } else {
-                Direction::Horizontal
-            };
-            let chunks = Layout::default()
-                .direction(dir)
-                .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .split(area);
+            let chunks = layout::split_oriented(
+                area,
+                self.horizontal_layout,
+                [Constraint::Percentage(40), Constraint::Percentage(60)],
+            );
 
             self.file_list_area = chunks[0];
             self.diff_area = chunks[1];

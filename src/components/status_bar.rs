@@ -2,7 +2,7 @@ use color_eyre::Result;
 use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::Color,
     text::{Line, Span},
     widgets::Paragraph,
 };
@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::app::FocusPanel;
 use crate::components::Component;
+use crate::components::style::{badge_span, fg_span, fg_style};
 
 pub(crate) struct StatusBar {
     pub focus: FocusPanel,
@@ -42,7 +43,7 @@ impl Component for StatusBar {
 
         // Always render version (right-aligned, dimmed)
         let version = Paragraph::new(version_text)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(fg_style(Color::DarkGray))
             .right_aligned();
         frame.render_widget(version, version_area);
 
@@ -50,14 +51,8 @@ impl Component for StatusBar {
         if let Some((ref msg, when)) = self.error {
             if when.elapsed().as_secs() < 5 {
                 let error_bar = Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        " ERROR ",
-                        Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Red)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!(" {}", msg), Style::default().fg(Color::Red)),
+                    badge("ERROR", Color::White, Color::Red),
+                    fg_span(format!(" {}", msg), Color::Red),
                 ]));
                 frame.render_widget(error_bar, content_area);
                 return Ok(());
@@ -70,14 +65,8 @@ impl Component for StatusBar {
         if let Some((ref msg, when)) = self.success {
             if when.elapsed().as_secs() < 3 {
                 let success_bar = Paragraph::new(Line::from(vec![
-                    Span::styled(
-                        " OK ",
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!(" {}", msg), Style::default().fg(Color::Green)),
+                    badge("OK", Color::Black, Color::Green),
+                    fg_span(format!(" {}", msg), Color::Green),
                 ]));
                 frame.render_widget(success_bar, content_area);
                 return Ok(());
@@ -92,13 +81,7 @@ impl Component for StatusBar {
             FocusPanel::Graph => "Graph",
         };
         let mut spans = vec![
-            Span::styled(
-                format!(" {} ", focus_label),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
+            badge(focus_label, Color::Black, Color::Cyan),
             Span::raw("  "),
             key_span("h"),
             Span::raw(" help"),
@@ -109,41 +92,24 @@ impl Component for StatusBar {
         if let Some(repo) = &self.focused_repo {
             spans.extend([
                 Span::raw("  "),
-                Span::styled(
-                    format!(" FOCUS {repo} "),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::LightMagenta)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                badge(format!("FOCUS {repo}"), Color::Black, Color::LightMagenta),
                 Span::raw(" Esc unlock"),
             ]);
         }
         if self.fast_mode {
-            spans.extend([
-                Span::raw("  "),
-                Span::styled(
-                    " FAST ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
+            spans.extend([Span::raw("  "), badge("FAST", Color::Black, Color::Yellow)]);
         }
 
-        let bar = Paragraph::new(Line::from(spans)).style(Style::default().fg(Color::Gray));
+        let bar = Paragraph::new(Line::from(spans)).style(fg_style(Color::Gray));
         frame.render_widget(bar, content_area);
         Ok(())
     }
 }
 
 fn key_span(key: &str) -> Span<'_> {
-    Span::styled(
-        format!(" {} ", key),
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD),
-    )
+    badge_span(key.to_string(), Color::Black, Color::DarkGray)
+}
+
+fn badge(text: impl Into<std::borrow::Cow<'static, str>>, fg: Color, bg: Color) -> Span<'static> {
+    badge_span(text, fg, bg)
 }

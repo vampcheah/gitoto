@@ -1,11 +1,11 @@
 use color_eyre::Result;
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    style::Color,
+    text::Line,
+    widgets::{ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -14,11 +14,17 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::action::Action;
-use crate::components::Component;
+use crate::components::diff_view;
+use crate::components::file_status_view;
+use crate::components::panel;
+use crate::components::scroll;
+use crate::components::selection;
+use crate::components::style::fg_style;
 use crate::git::graph::{BranchSegment, GraphBuilder, GraphOptions, GraphRow};
 use crate::git::graph_render;
 
 mod collapse;
+mod component;
 mod detail;
 mod search;
 use detail::CommitDetail;
@@ -172,12 +178,8 @@ impl GitGraph {
         self.loading = false;
         self.recompute_segments();
         self.recompute_collapsed_rows();
-        if !self.display_rows().is_empty() {
-            let idx = prev_selected
-                .map(|i| i.min(self.display_rows().len() - 1))
-                .unwrap_or(0);
-            self.state.select(Some(idx));
-        }
+        let row_count = self.display_rows().len();
+        selection::preserve_or_first(&mut self.state, prev_selected, row_count);
     }
 
     pub fn set_diff_stats(&mut self, stats: Vec<(git2::Oid, crate::git::graph::DiffStat)>) {
@@ -214,28 +216,12 @@ impl GitGraph {
         let start = selected.saturating_sub(visible / 2);
         let end = (start + visible + 8).min(rows.len());
 
-        let candidates: Vec<_> = rows[start..end]
-            .iter()
-            .filter_map(|row| {
-                if row.collapsed.is_some()
-                    || row.diff_stat.is_some()
-                    || self.diff_stat_cache.contains_key(&row.oid)
-                    || self.pending_diff_stats.contains(&row.oid)
-                {
-                    None
-                } else {
-                    Some(row.oid)
-                }
-            })
-            .collect();
-
-        let mut oids = Vec::new();
-        for oid in candidates {
-            if self.pending_diff_stats.insert(oid) {
-                oids.push(oid);
-            }
-        }
-
+        let candidates = visible_diff_candidates(
+            &rows[start..end],
+            &self.diff_stat_cache,
+            &self.pending_diff_stats,
+        );
+        let oids = register_pending_oids(candidates, &mut self.pending_diff_stats);
         if oids.is_empty() {
             return;
         }
@@ -285,7 +271,7 @@ impl GitGraph {
     pub fn set_commit_diff(&mut self, content: String) {
         if let Some(ref mut detail) = self.commit_detail {
             detail.diff_content = Some(content);
-            detail.diff_scroll = 0;
+            scroll::reset(&mut detail.diff_scroll);
         }
     }
 
@@ -483,28 +469,6 @@ impl GitGraph {
         }
     }
 
-    fn select_next(&mut self) {
-        if self.display_rows().is_empty() {
-            return;
-        }
-        let i = match self.state.selected() {
-            Some(i) => (i + 1).min(self.display_rows().len() - 1),
-            None => 0,
-        };
-        self.state.select(Some(i));
-    }
-
-    fn select_prev(&mut self) {
-        if self.display_rows().is_empty() {
-            return;
-        }
-        let i = match self.state.selected() {
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
-        self.state.select(Some(i));
-    }
-
     fn try_show_commit_files(&mut self) -> Option<Action> {
         let idx = self.state.selected()?;
         let oid = self.display_rows().get(idx)?.oid.to_string();
@@ -543,14 +507,11 @@ impl GitGraph {
             Color::DarkGray
         };
 
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
+        let block = panel::bordered_block(title, border_color);
 
         if self.loading {
             let paragraph = Paragraph::new("Loading graph...")
-                .style(Style::default().fg(Color::Yellow))
+                .style(fg_style(Color::Yellow))
                 .block(block);
             frame.render_widget(paragraph, area);
             return;
@@ -558,7 +519,7 @@ impl GitGraph {
 
         if let Some(ref err) = self.error {
             let paragraph = Paragraph::new(err.as_str())
-                .style(Style::default().fg(Color::Red))
+                .style(fg_style(Color::Red))
                 .block(block);
             frame.render_widget(paragraph, area);
             return;
@@ -566,7 +527,7 @@ impl GitGraph {
 
         if self.display_rows().is_empty() {
             let paragraph = Paragraph::new("No commits")
-                .style(Style::default().fg(Color::Gray))
+                .style(fg_style(Color::Gray))
                 .block(block);
             frame.render_widget(paragraph, area);
             return;
@@ -591,98 +552,19 @@ impl GitGraph {
             .map(|(local_i, row)| {
                 let row_idx = start + local_i;
                 let dimmed = has_search && !self.search.matches.contains(&row_idx);
-                let is_collapsed = row.collapsed.is_some();
-                let mut spans = graph_render::render_graph_prefix(row);
-
-                if dimmed || is_collapsed {
-                    for span in &mut spans {
-                        span.style = Style::default().fg(Color::DarkGray);
-                    }
-                }
-
-                if is_collapsed {
-                    // Collapsed placeholder: show only the message with italic style
-                    spans.push(Span::styled(
-                        row.message.clone(),
-                        Style::default()
-                            .fg(Color::Rgb(130, 130, 130))
-                            .add_modifier(Modifier::ITALIC),
-                    ));
-                } else {
-                    let id_style = if dimmed {
-                        Style::default().fg(Color::DarkGray)
-                    } else {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    };
-                    spans.push(Span::styled(format!("{} ", row.short_id), id_style));
-
-                    if !dimmed {
-                        spans.extend(graph_render::render_branch_labels(
-                            &row.labels,
-                            label_max_len,
-                        ));
-                    }
-
-                    let msg_color = if dimmed {
-                        Color::DarkGray
-                    } else if row.is_merge {
-                        Color::Rgb(130, 130, 130)
-                    } else {
-                        Color::White
-                    };
-                    spans.push(Span::styled(
-                        row.message.clone(),
-                        Style::default().fg(msg_color),
-                    ));
-
-                    let author_color = if dimmed {
-                        Color::DarkGray
-                    } else {
-                        graph_render::author_color(&row.author)
-                    };
-                    spans.push(Span::styled(
-                        format!("  — {}", row.author),
-                        Style::default().fg(author_color),
-                    ));
-                    spans.push(Span::styled(
-                        format!(" {}", graph_render::format_relative_time(row.time)),
-                        Style::default().fg(Color::DarkGray),
-                    ));
-
-                    if let Some(ref stat) = row.diff_stat
-                        && !dimmed
-                    {
-                        if stat.additions > 0 {
-                            spans.push(Span::styled(
-                                format!(" +{}", stat.additions),
-                                Style::default().fg(Color::Green),
-                            ));
-                        }
-                        if stat.deletions > 0 {
-                            spans.push(Span::styled(
-                                format!(" -{}", stat.deletions),
-                                Style::default().fg(Color::Red),
-                            ));
-                        }
-                    }
-                }
-
+                let mut spans = graph_render::render_commit_row(row, label_max_len, dimmed);
                 graph_render::h_scroll_line(&mut spans, self.h_scroll, max_width);
                 ListItem::new(Line::from(spans))
             })
             .collect();
 
-        let list = List::new(items).block(block).highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        );
-
         let mut render_state = ListState::default();
         render_state.select(Some(selected.saturating_sub(start)));
-        frame.render_stateful_widget(list, area, &mut render_state);
+        frame.render_stateful_widget(
+            panel::highlighted_list(items, block),
+            area,
+            &mut render_state,
+        );
     }
 
     fn draw_commit_files(detail: &mut CommitDetail, frame: &mut Frame, area: Rect) {
@@ -704,26 +586,21 @@ impl GitGraph {
         detail.file_list_area = chunks[1];
 
         // Draw commit message block
-        let msg_block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+        let msg_block = panel::bordered_block(title, Color::Cyan);
 
         let msg_paragraph = Paragraph::new(detail.message.as_str())
-            .style(Style::default().fg(Color::White))
+            .style(fg_style(Color::White))
             .block(msg_block)
             .wrap(Wrap { trim: false })
             .scroll((detail.msg_scroll, 0));
         frame.render_widget(msg_paragraph, chunks[0]);
 
         // Draw file list block
-        let files_block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
+        let files_block = panel::plain_block(Color::Cyan);
 
         if detail.files.is_empty() {
             let paragraph = Paragraph::new("No files changed")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(fg_style(Color::DarkGray))
                 .block(files_block);
             frame.render_widget(paragraph, chunks[1]);
             return;
@@ -732,32 +609,14 @@ impl GitGraph {
         let items: Vec<ListItem> = detail
             .files
             .iter()
-            .map(|(status, path)| {
-                let color = match status.as_str() {
-                    "M" => Color::Yellow,
-                    "A" => Color::Green,
-                    "D" => Color::Red,
-                    "R" => Color::Blue,
-                    _ => Color::DarkGray,
-                };
-                let spans = vec![
-                    Span::styled(
-                        format!(" {} ", status),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(path, Style::default().fg(Color::White)),
-                ];
-                ListItem::new(Line::from(spans))
-            })
+            .map(|(status, path)| file_status_view::commit_file_item(status, path))
             .collect();
 
-        let list = List::new(items).block(files_block).highlight_style(
-            Style::default()
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
+        frame.render_stateful_widget(
+            panel::highlighted_list(items, files_block),
+            chunks[1],
+            &mut detail.file_state,
         );
-
-        frame.render_stateful_widget(list, chunks[1], &mut detail.file_state);
     }
 
     fn draw_commit_diff(detail: &CommitDetail, frame: &mut Frame, area: Rect) {
@@ -765,424 +624,110 @@ impl GitGraph {
             return;
         };
 
-        let block = Block::default()
-            .title(" Commit Diff (Esc to close) ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan));
-
-        let lines: Vec<Line> = content
-            .lines()
-            .map(|line| {
-                let style = if line.starts_with('+') && !line.starts_with("+++") {
-                    Style::default().fg(Color::Green)
-                } else if line.starts_with('-') && !line.starts_with("---") {
-                    Style::default().fg(Color::Red)
-                } else if line.starts_with("@@") {
-                    Style::default().fg(Color::Cyan)
-                } else if line.starts_with("diff ") || line.starts_with("index ") {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                Line::from(Span::styled(line, style))
-            })
-            .collect();
-
-        let paragraph = Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false })
-            .scroll((detail.diff_scroll, 0));
-
-        frame.render_widget(paragraph, area);
+        diff_view::render_diff(
+            frame,
+            area,
+            " Commit Diff (Esc to close) ".to_string(),
+            content,
+            detail.diff_scroll,
+        );
     }
 }
 
-impl Component for GitGraph {
-    fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> Result<()> {
-        self.action_tx = Some(tx);
-        Ok(())
-    }
-
-    fn handle_key_event(&mut self, key: KeyEvent) -> Result<Option<Action>> {
-        // When detail is open, Esc/keys are layered
-        if let Some(ref mut detail) = self.commit_detail {
-            if detail.diff_content.is_some() {
-                // Viewing commit diff
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-                        detail.diff_content = None;
-                        detail.diff_scroll = 0;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        detail.diff_scroll = detail.diff_scroll.saturating_add(1);
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        detail.diff_scroll = detail.diff_scroll.saturating_sub(1);
-                    }
-                    _ => {}
-                }
-                return Ok(None);
-            }
-
-            // Viewing commit file list
-            match key.code {
-                KeyCode::Esc => {
-                    self.commit_detail = None;
-                    if std::mem::take(&mut self.needs_reload) {
-                        self.reload_graph();
-                    }
-                    return Ok(None);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if !detail.files.is_empty() {
-                        let i = detail
-                            .file_state
-                            .selected()
-                            .map(|i| (i + 1).min(detail.files.len() - 1))
-                            .unwrap_or(0);
-                        detail.file_state.select(Some(i));
-                    }
-                    return Ok(None);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    if !detail.files.is_empty() {
-                        let i = detail
-                            .file_state
-                            .selected()
-                            .map(|i| i.saturating_sub(1))
-                            .unwrap_or(0);
-                        detail.file_state.select(Some(i));
-                    }
-                    return Ok(None);
-                }
-                KeyCode::Enter => {
-                    return Ok(self.try_show_commit_diff());
-                }
-                _ => return Ok(None),
-            }
-        }
-
-        // No detail open — normal graph navigation
-        match key.code {
-            KeyCode::Char('n') => {
-                self.search_next();
-                Ok(None)
-            }
-            KeyCode::Char('N') => {
-                self.search_prev();
-                Ok(None)
-            }
-            KeyCode::Char('/') => {
-                self.search.open();
-                Ok(None)
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.select_next();
-                Ok(None)
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.select_prev();
-                Ok(None)
-            }
-            KeyCode::Enter => Ok(self.try_show_commit_files()),
-            KeyCode::Char('f') => {
-                self.graph_options.first_parent = !self.graph_options.first_parent;
-                self.reload_graph();
-                Ok(None)
-            }
-            KeyCode::Char('c') => {
-                self.toggle_collapse_selected();
-                Ok(None)
-            }
-            KeyCode::Char('H') => {
-                self.expand_all_branches();
-                Ok(None)
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                self.h_scroll = self.h_scroll.saturating_add(4);
-                Ok(None)
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                self.h_scroll = self.h_scroll.saturating_sub(4);
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
-    }
-
-    fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<Option<Action>> {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => {
-                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-
-                // Click in graph list area
-                if self.graph_list_area.contains(pos) {
-                    let content_y = self.graph_list_area.y + 1;
-                    if mouse.row >= content_y {
-                        let visual_row = (mouse.row - content_y) as usize;
-                        let idx = visual_row + self.state.offset();
-                        if idx < self.display_rows().len() {
-                            // Click on already-selected row opens commit files
-                            if self.state.selected() == Some(idx) && self.commit_detail.is_none() {
-                                return Ok(self.try_show_commit_files());
-                            }
-                            self.state.select(Some(idx));
-                            self.commit_detail = None;
-                            if std::mem::take(&mut self.needs_reload) {
-                                self.reload_graph();
-                            }
-                        }
-                    }
-                    return Ok(None);
-                }
-
-                // Click in commit files area (use file_list_area, not files_area)
-                let mut open_file_diff = false;
-                if let Some(ref mut detail) = self.commit_detail
-                    && detail.file_list_area.contains(pos)
-                {
-                    let content_y = detail.file_list_area.y + 1;
-                    if mouse.row >= content_y {
-                        let visual_row = (mouse.row - content_y) as usize;
-                        let idx = visual_row + detail.file_state.offset();
-                        if idx < detail.files.len() {
-                            if detail.file_state.selected() == Some(idx) {
-                                open_file_diff = true;
-                            } else {
-                                detail.file_state.select(Some(idx));
-                            }
-                        }
-                    }
-                }
-                if open_file_diff {
-                    return Ok(self.try_show_commit_diff());
-                }
-
-                Ok(None)
-            }
-            MouseEventKind::ScrollUp => {
-                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-                if let Some(ref mut detail) = self.commit_detail {
-                    if self.diff_area.contains(pos) && detail.diff_content.is_some() {
-                        detail.diff_scroll = detail.diff_scroll.saturating_sub(1);
-                        return Ok(None);
-                    }
-                    if detail.msg_area.contains(pos) {
-                        detail.msg_scroll = detail.msg_scroll.saturating_sub(1);
-                        return Ok(None);
-                    }
-                    if detail.file_list_area.contains(pos) && !detail.files.is_empty() {
-                        let i = detail
-                            .file_state
-                            .selected()
-                            .map(|i| i.saturating_sub(1))
-                            .unwrap_or(0);
-                        detail.file_state.select(Some(i));
-                        return Ok(None);
-                    }
-                }
-                self.select_prev();
-                Ok(None)
-            }
-            MouseEventKind::ScrollDown => {
-                let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
-                if let Some(ref mut detail) = self.commit_detail {
-                    if self.diff_area.contains(pos) && detail.diff_content.is_some() {
-                        detail.diff_scroll = detail.diff_scroll.saturating_add(1);
-                        return Ok(None);
-                    }
-                    if detail.msg_area.contains(pos) {
-                        detail.msg_scroll = detail.msg_scroll.saturating_add(1);
-                        return Ok(None);
-                    }
-                    if detail.file_list_area.contains(pos) && !detail.files.is_empty() {
-                        let i = detail
-                            .file_state
-                            .selected()
-                            .map(|i| (i + 1).min(detail.files.len() - 1))
-                            .unwrap_or(0);
-                        detail.file_state.select(Some(i));
-                        return Ok(None);
-                    }
-                }
-                self.select_next();
-                Ok(None)
-            }
-            MouseEventKind::ScrollLeft => {
-                self.h_scroll = self.h_scroll.saturating_sub(4);
-                Ok(None)
-            }
-            MouseEventKind::ScrollRight => {
-                self.h_scroll = self.h_scroll.saturating_add(4);
-                Ok(None)
-            }
-            MouseEventKind::Down(MouseButton::Right) => Ok(None),
-            _ => Ok(None),
-        }
-    }
-
-    fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
-        self.render_area = area;
-
-        match &self.commit_detail {
-            Some(detail) if detail.diff_content.is_some() => {
-                // Graph 40% | Files 25% | Diff 35%
-                let dir = if self.horizontal_layout {
-                    Direction::Vertical
-                } else {
-                    Direction::Horizontal
-                };
-                let chunks = Layout::default()
-                    .direction(dir)
-                    .constraints([
-                        Constraint::Percentage(40),
-                        Constraint::Percentage(25),
-                        Constraint::Percentage(35),
-                    ])
-                    .split(area);
-
-                self.graph_list_area = chunks[0];
-                self.files_area = chunks[1];
-                self.diff_area = chunks[2];
-
-                self.draw_graph_list(frame, chunks[0]);
-                // Borrow detail mutably for drawing
-                let detail = self.commit_detail.as_mut().unwrap();
-                Self::draw_commit_files(detail, frame, chunks[1]);
-                Self::draw_commit_diff(detail, frame, chunks[2]);
-            }
-            Some(_) => {
-                // Graph 50% | Files 50%
-                let dir = if self.horizontal_layout {
-                    Direction::Vertical
-                } else {
-                    Direction::Horizontal
-                };
-                let chunks = Layout::default()
-                    .direction(dir)
-                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(area);
-
-                self.graph_list_area = chunks[0];
-                self.files_area = chunks[1];
-                self.diff_area = Rect::default();
-
-                self.draw_graph_list(frame, chunks[0]);
-                let detail = self.commit_detail.as_mut().unwrap();
-                Self::draw_commit_files(detail, frame, chunks[1]);
-            }
-            None => {
-                self.graph_list_area = area;
-                self.files_area = Rect::default();
-                self.diff_area = Rect::default();
-
-                self.draw_graph_list(frame, area);
-            }
-        }
-
-        // Search overlay at bottom of graph area
-        if self.search.visible {
-            let match_info = if self.search.input.is_empty() {
-                String::new()
+fn visible_diff_candidates(
+    rows: &[GraphRow],
+    diff_stat_cache: &HashMap<git2::Oid, crate::git::graph::DiffStat>,
+    pending_diff_stats: &HashSet<git2::Oid>,
+) -> Vec<git2::Oid> {
+    rows.iter()
+        .filter_map(|row| {
+            if row.collapsed.is_some()
+                || row.diff_stat.is_some()
+                || diff_stat_cache.contains_key(&row.oid)
+                || pending_diff_stats.contains(&row.oid)
+            {
+                None
             } else {
-                let current = self.search.current_match.map(|i| i + 1).unwrap_or(0);
-                format!(" {}/{}", current, self.search.matches.len())
-            };
-            let overlay_text = format!(" / {}{} ", self.search.input, match_info);
-            let overlay_area = Rect::new(
-                self.graph_list_area.x,
-                self.graph_list_area.y + self.graph_list_area.height.saturating_sub(1),
-                self.graph_list_area
-                    .width
-                    .min(overlay_text.len() as u16 + 2),
-                1,
-            );
-            let overlay = Paragraph::new(overlay_text)
-                .style(Style::default().fg(Color::White).bg(Color::DarkGray));
-            frame.render_widget(overlay, overlay_area);
-        }
+                Some(row.oid)
+            }
+        })
+        .collect()
+}
 
-        Ok(())
-    }
+fn register_pending_oids(
+    candidates: Vec<git2::Oid>,
+    pending_diff_stats: &mut HashSet<git2::Oid>,
+) -> Vec<git2::Oid> {
+    candidates
+        .into_iter()
+        .filter(|oid| pending_diff_stats.insert(*oid))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::git::graph::{BranchLabel, GraphRow, LaneSegment};
-    use git2::Oid;
+    use crate::git::graph::GraphRow;
+    use crate::git::test_support;
 
     fn mock_row(short_id: &str, message: &str, author: &str) -> GraphRow {
-        GraphRow {
-            commit_col: 0,
-            lanes: vec![LaneSegment::Commit],
-            horizontal_spans: Vec::new(),
-            oid: Oid::from_str("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
-            short_id: short_id.to_string(),
-            message: message.to_string(),
-            author: author.to_string(),
-            time: 0,
-            labels: Vec::new(),
-            is_pushed: false,
-            is_merge: false,
-            parent_oids: Vec::new(),
-            diff_stat: None,
-            collapsed: None,
-        }
+        test_support::graph_row_text(short_id, message, author)
+    }
+
+    fn graph_with_rows(rows: Vec<GraphRow>) -> GitGraph {
+        let mut graph = GitGraph::new();
+        graph.set_rows(rows);
+        graph
+    }
+
+    fn search_matches(rows: Vec<GraphRow>, query: &str) -> GitGraph {
+        let mut graph = graph_with_rows(rows);
+        graph.search.input = query.to_string();
+        graph.update_search_matches();
+        graph
     }
 
     #[test]
     fn test_search_matches_message() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![
-            mock_row("abc1234", "fix: resolve crash", "Alice"),
-            mock_row("def5678", "feat: add login", "Bob"),
-            mock_row("ghi9012", "chore: update deps", "Alice"),
-        ]);
-
-        graph.search.input = "login".to_string();
-        graph.update_search_matches();
-
+        let graph = search_matches(
+            vec![
+                mock_row("abc1234", "fix: resolve crash", "Alice"),
+                mock_row("def5678", "feat: add login", "Bob"),
+                mock_row("ghi9012", "chore: update deps", "Alice"),
+            ],
+            "login",
+        );
         assert_eq!(graph.search.matches, vec![1]);
     }
 
     #[test]
     fn test_search_matches_author() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![
-            mock_row("abc1234", "first", "Alice"),
-            mock_row("def5678", "second", "Bob"),
-            mock_row("ghi9012", "third", "Alice"),
-        ]);
-
-        graph.search.input = "alice".to_string();
-        graph.update_search_matches();
-
+        let graph = search_matches(
+            vec![
+                mock_row("abc1234", "first", "Alice"),
+                mock_row("def5678", "second", "Bob"),
+                mock_row("ghi9012", "third", "Alice"),
+            ],
+            "alice",
+        );
         assert_eq!(graph.search.matches, vec![0, 2]);
     }
 
     #[test]
     fn test_search_matches_short_id() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![
-            mock_row("abc1234", "first", "Alice"),
-            mock_row("def5678", "second", "Bob"),
-        ]);
-
-        graph.search.input = "def".to_string();
-        graph.update_search_matches();
-
+        let graph = search_matches(
+            vec![
+                mock_row("abc1234", "first", "Alice"),
+                mock_row("def5678", "second", "Bob"),
+            ],
+            "def",
+        );
         assert_eq!(graph.search.matches, vec![1]);
     }
 
     #[test]
     fn test_search_case_insensitive() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![mock_row("abc1234", "Fix Bug", "Alice")]);
-
-        graph.search.input = "fix bug".to_string();
-        graph.update_search_matches();
-
+        let graph = search_matches(vec![mock_row("abc1234", "Fix Bug", "Alice")], "fix bug");
         assert_eq!(graph.search.matches, vec![0]);
     }
 
@@ -1230,8 +775,7 @@ mod tests {
 
     #[test]
     fn test_search_empty_input_no_matches() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![mock_row("a", "hello", "X")]);
+        let mut graph = graph_with_rows(vec![mock_row("a", "hello", "X")]);
 
         graph.search.input.clear();
         graph.update_search_matches();
@@ -1242,81 +786,42 @@ mod tests {
 
     #[test]
     fn test_search_no_results() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(vec![mock_row("a", "hello", "Alice")]);
-
-        graph.search.input = "zzzzz".to_string();
-        graph.update_search_matches();
-
+        let graph = search_matches(vec![mock_row("a", "hello", "Alice")], "zzzzz");
         assert!(graph.search.matches.is_empty());
         assert_eq!(graph.search.current_match, None);
-    }
-
-    fn make_label(name: &str) -> BranchLabel {
-        BranchLabel {
-            name: name.to_string(),
-            is_head: false,
-            is_remote: false,
-            is_worktree: false,
-            is_tag: false,
-        }
-    }
-
-    const OID_M: &str = "1111111111111111111111111111111111111111";
-    const OID_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const OID_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const OID_C: &str = "cccccccccccccccccccccccccccccccccccccccc";
-
-    /// Build a DAG-wired row. `oid_str` must be valid hex.
-    fn dag_row(
-        oid_str: &str,
-        short_id: &str,
-        parent_oids: Vec<Oid>,
-        col: usize,
-        labels: Vec<BranchLabel>,
-    ) -> GraphRow {
-        GraphRow {
-            commit_col: col,
-            lanes: vec![LaneSegment::Commit],
-            horizontal_spans: Vec::new(),
-            oid: Oid::from_str(oid_str).unwrap(),
-            short_id: short_id.to_string(),
-            message: format!("msg-{short_id}"),
-            author: "Author".to_string(),
-            time: 0,
-            labels,
-            is_pushed: false,
-            is_merge: parent_oids.len() > 1,
-            parent_oids,
-            diff_stat: None,
-            collapsed: None,
-        }
     }
 
     /// Standard topology for collapse tests:
     /// Row 0: main0 (col=0, parents=[], labels=["main"])  ← main trunk
     /// Row 1: tip   (col=1, parents=[mid], labels)         ← side branch tip
     /// Row 2: mid   (col=1, parents=[main0])               ← side branch base
-    fn make_branch_rows(tip_labels: Vec<BranchLabel>) -> Vec<GraphRow> {
-        let oid_m = Oid::from_str(OID_M).unwrap();
-        let oid_b = Oid::from_str(OID_B).unwrap();
-
+    fn make_branch_rows(tip_labels: Vec<crate::git::graph::BranchLabel>) -> Vec<GraphRow> {
         vec![
-            dag_row(OID_M, "m", vec![], 0, vec![make_label("main")]),
-            dag_row(OID_A, "a", vec![oid_b], 1, tip_labels),
-            dag_row(OID_B, "b", vec![oid_m], 1, vec![]),
+            test_support::dag_row('1', "m", &[], vec![test_support::branch_label("main")]),
+            test_support::dag_row('a', "a", &['b'], tip_labels),
+            test_support::dag_row('b', "b", &['1'], vec![]),
         ]
+    }
+
+    fn collapse_branch_rows(
+        tip_labels: Vec<crate::git::graph::BranchLabel>,
+        selected: usize,
+    ) -> GitGraph {
+        let mut graph = graph_with_rows(make_branch_rows(tip_labels));
+        graph.state.select(Some(selected));
+        graph.toggle_collapse_selected();
+        graph
     }
 
     #[test]
     fn test_collapse_labeled_branch() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(make_branch_rows(vec![make_label("feature")]));
-        // Select tip (row 1 in all_rows, row 1 in display)
-        graph.state.select(Some(1));
-        graph.toggle_collapse_selected();
+        let graph = collapse_branch_rows(vec![test_support::branch_label("feature")], 1);
 
-        assert!(graph.collapsed_branches.contains(OID_A));
+        assert!(
+            graph
+                .collapsed_branches
+                .contains(test_support::oid_id('a').as_str())
+        );
         // main0 + placeholder = 2 rows
         assert_eq!(graph.rows.len(), 2);
         let (_, count) = graph.rows[1].collapsed.as_ref().unwrap();
@@ -1326,13 +831,13 @@ mod tests {
 
     #[test]
     fn test_collapse_unlabeled_merge_lane() {
-        let mut graph = GitGraph::new();
-        // No labels on the side branch
-        graph.set_rows(make_branch_rows(vec![]));
-        graph.state.select(Some(2)); // select base row of side branch
-        graph.toggle_collapse_selected();
+        let graph = collapse_branch_rows(vec![], 2);
 
-        assert!(graph.collapsed_branches.contains(OID_A));
+        assert!(
+            graph
+                .collapsed_branches
+                .contains(test_support::oid_id('a').as_str())
+        );
         assert_eq!(graph.rows.len(), 2);
         // Placeholder uses short OID since there's no label
         assert!(graph.rows[1].message.contains("a"));
@@ -1341,7 +846,9 @@ mod tests {
     #[test]
     fn test_expand_collapsed_group() {
         let mut graph = GitGraph::new();
-        graph.set_rows(make_branch_rows(vec![make_label("feature")]));
+        graph.set_rows(make_branch_rows(vec![test_support::branch_label(
+            "feature",
+        )]));
         graph.state.select(Some(1));
         graph.toggle_collapse_selected();
         assert_eq!(graph.rows.len(), 2);
@@ -1356,13 +863,13 @@ mod tests {
 
     #[test]
     fn test_collapse_from_middle_of_branch() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(make_branch_rows(vec![make_label("feature")]));
-        // Select the base row (row 2) — should collapse the whole segment
-        graph.state.select(Some(2));
-        graph.toggle_collapse_selected();
+        let graph = collapse_branch_rows(vec![test_support::branch_label("feature")], 2);
 
-        assert!(graph.collapsed_branches.contains(OID_A));
+        assert!(
+            graph
+                .collapsed_branches
+                .contains(test_support::oid_id('a').as_str())
+        );
         assert_eq!(graph.rows.len(), 2);
         assert!(graph.rows[1].collapsed.is_some());
     }
@@ -1370,7 +877,7 @@ mod tests {
     #[test]
     fn test_expand_all() {
         let mut graph = GitGraph::new();
-        graph.set_rows(make_branch_rows(vec![make_label("feat-a")]));
+        graph.set_rows(make_branch_rows(vec![test_support::branch_label("feat-a")]));
         graph.state.select(Some(1));
         graph.toggle_collapse_selected();
         assert!(!graph.collapsed_branches.is_empty());
@@ -1382,11 +889,7 @@ mod tests {
 
     #[test]
     fn test_main_trunk_not_collapsible() {
-        let mut graph = GitGraph::new();
-        graph.set_rows(make_branch_rows(vec![]));
-        // Select main trunk row (row 0)
-        graph.state.select(Some(0));
-        graph.toggle_collapse_selected();
+        let graph = collapse_branch_rows(vec![], 0);
 
         assert!(graph.collapsed_branches.is_empty());
         assert_eq!(graph.display_rows().len(), 3);
@@ -1398,23 +901,23 @@ mod tests {
         // Row 1: tip_x (col=1, parents=[base_x]) -- branch X
         // Row 2: main1 (col=0, parents=[])        -- main trunk
         // Row 3: base_x (col=1, parents=[main0])  -- branch X (interleaved with main1)
-        let oid_m0 = Oid::from_str(OID_M).unwrap();
-        let oid_b = Oid::from_str(OID_B).unwrap();
-        let oid_c = Oid::from_str(OID_C).unwrap();
-
         let mut graph = GitGraph::new();
         graph.set_rows(vec![
-            dag_row(OID_M, "m0", vec![oid_c], 0, vec![make_label("main")]),
-            dag_row(OID_A, "a", vec![oid_b], 1, vec![]),
-            dag_row(OID_C, "c", vec![], 0, vec![]),
-            dag_row(OID_B, "b", vec![oid_m0], 1, vec![]),
+            test_support::dag_row('1', "m0", &['c'], vec![test_support::branch_label("main")]),
+            test_support::dag_row('a', "a", &['b'], vec![]),
+            test_support::dag_row('c', "c", &[], vec![]),
+            test_support::dag_row('b', "b", &['1'], vec![]),
         ]);
 
         // Select row 1 (tip of branch X)
         graph.state.select(Some(1));
         graph.toggle_collapse_selected();
 
-        assert!(graph.collapsed_branches.contains(OID_A));
+        assert!(
+            graph
+                .collapsed_branches
+                .contains(test_support::oid_id('a').as_str())
+        );
         // Rows 1 and 3 (non-contiguous) should both be collapsed
         // main0 + placeholder + main1 = 3 rows
         assert_eq!(graph.rows.len(), 3);
@@ -1424,11 +927,7 @@ mod tests {
 
     #[test]
     fn test_unlabeled_branch_collapsible() {
-        let mut graph = GitGraph::new();
-        // No labels on any side-branch row
-        graph.set_rows(make_branch_rows(vec![]));
-        graph.state.select(Some(1));
-        graph.toggle_collapse_selected();
+        let graph = collapse_branch_rows(vec![], 1);
 
         assert!(!graph.collapsed_branches.is_empty());
         // Placeholder uses short OID as display name

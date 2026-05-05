@@ -2,14 +2,17 @@ use color_eyre::Result;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     Frame,
-    layout::{Constraint, Flex, Layout, Rect},
-    style::{Color, Modifier, Style},
+    layout::Rect,
+    style::Color,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Clear, Paragraph, Wrap},
 };
 
 use crate::action::Action;
 use crate::components::Component;
+use crate::components::layout::modal_rect;
+use crate::components::panel;
+use crate::components::style::badge_span;
 
 pub(crate) struct NoticeDialog {
     pub visible: bool,
@@ -51,14 +54,7 @@ impl Component for NoticeDialog {
             return Ok(());
         }
 
-        let width = 72u16.min(area.width.saturating_sub(4)).max(20);
-        let height = 9u16.min(area.height.saturating_sub(2)).max(5);
-        let [vert] = Layout::vertical([Constraint::Length(height)])
-            .flex(Flex::Center)
-            .areas(area);
-        let [rect] = Layout::horizontal([Constraint::Length(width)])
-            .flex(Flex::Center)
-            .areas(vert);
+        let rect = modal_rect(area, 72, 20, 9, 5);
 
         frame.render_widget(Clear, rect);
 
@@ -66,31 +62,15 @@ impl Component for NoticeDialog {
             Line::from(self.message.as_str()),
             Line::from(""),
             Line::from(vec![
-                Span::styled(
-                    " Enter ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                badge_span("Enter", Color::Black, Color::Cyan),
                 Span::raw(" / "),
-                Span::styled(
-                    " Esc ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                badge_span("Esc", Color::Black, Color::DarkGray),
                 Span::raw(" close"),
             ]),
         ];
 
-        let block = Block::default()
-            .title(" Notice ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow));
         let paragraph = Paragraph::new(lines)
-            .block(block)
+            .block(panel::bordered_block(" Notice ".to_string(), Color::Yellow))
             .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, rect);
         Ok(())

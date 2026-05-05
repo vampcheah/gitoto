@@ -30,6 +30,9 @@ max_concurrent_polls = 4
 # Run a full local scan every N local polls; other local polls focus on selected/uninitialized repos (default: 12)
 poll_local_full_every = 12
 
+# Directory names ignored by filesystem watcher events
+watch_exclude_dirs = ["node_modules", "target", ".build", "dist", "vendor"]
+
 [ui]
 # Terminal refresh rate in frames per second (default: 10)
 frame_rate = 10
@@ -39,6 +42,13 @@ check_for_updates = false
 
 # Where to show the update notification: "top-right" or "top-left" (default: "top-right")
 update_position = "top-right"
+
+# Repo display format: "folder-github", "folder", "parent-folder", or "path"
+repo_name_format = "folder-github"
+
+[github]
+# GitHub and GitHub Enterprise hosts used for URL detection/actions
+hosts = ["github.com"]
 
 [graph]
 # Branch filter for commit graph: "all", "local", "remote", or "none" (default: "all")
@@ -53,6 +63,10 @@ show_stats = true
 [status]
 # Untracked scan mode: "all", "normal", or "none" (default: "all")
 untracked = "all"
+
+[submodules]
+# Ignore dirty submodule worktrees in repository dirty state (default: false)
+ignore_dirty = false
 
 [performance]
 # Start in fast mode: no automatic fetch polling, graph diff stats, or untracked scans (default: false)
