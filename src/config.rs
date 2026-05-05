@@ -1,7 +1,7 @@
 use color_eyre::Result;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::git::status::UntrackedMode;
 
@@ -271,14 +271,19 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Result<Self> {
-        let config_path = Self::config_path();
+        Self::load_or_create_at(&Self::config_path())
+    }
+
+    fn load_or_create_at(config_path: &Path) -> Result<Self> {
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
             let mut config: Config = toml::from_str(&contents)?;
             config.expand_tildes();
             Ok(config)
         } else {
-            Ok(Self::default())
+            let config = Self::default();
+            config.save_to_path(config_path)?;
+            Ok(config)
         }
     }
 
@@ -289,12 +294,15 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let config_path = Self::config_path();
+        self.save_to_path(&Self::config_path())
+    }
+
+    fn save_to_path(&self, config_path: &Path) -> Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(&config_path, contents)?;
+        std::fs::write(config_path, contents)?;
         Ok(())
     }
 
@@ -363,6 +371,20 @@ mod tests {
 
         let loaded: Config = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.pinned_repos, vec![PathBuf::from("/tmp/test-repo")]);
+    }
+
+    #[test]
+    fn test_load_creates_missing_config_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("gitoto").join("config.toml");
+
+        assert!(!path.exists());
+        let config = Config::load_or_create_at(&path).unwrap();
+
+        assert!(path.exists());
+        let expected = toml::to_string_pretty(&Config::default()).unwrap();
+        assert_eq!(toml::to_string_pretty(&config).unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     }
 
     #[test]

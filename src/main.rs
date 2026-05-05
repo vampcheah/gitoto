@@ -21,8 +21,8 @@ struct Cli {
     root: Option<PathBuf>,
 
     /// UI frame rate (deprecated — rendering is now on-demand)
-    #[arg(long, default_value_t = 10, hide = true)]
-    frame_rate: u16,
+    #[arg(long, hide = true)]
+    frame_rate: Option<u16>,
 
     /// Start in fast mode: skip automatic fetch polling, graph stats, and untracked scans
     #[arg(long)]
@@ -57,20 +57,25 @@ async fn main() -> Result<()> {
 
     let mut config = config::Config::load()?;
 
-    let root = match cli.root {
-        Some(root) => root,
-        None => std::env::current_dir()?,
-    };
-    config.override_root(root);
+    config.override_root(root_dir(cli.root)?);
     if cli.fast {
         config.performance.fast_mode = true;
     }
-    config.ui.frame_rate = cli.frame_rate;
+    if let Some(frame_rate) = cli.frame_rate {
+        config.ui.frame_rate = frame_rate;
+    }
 
     let mut app = app::App::new(config);
     app.run().await?;
 
     Ok(())
+}
+
+fn root_dir(cli_root: Option<PathBuf>) -> Result<PathBuf> {
+    Ok(match cli_root {
+        Some(root) => root,
+        None => std::env::current_dir()?,
+    })
 }
 
 fn self_update() -> Result<()> {
@@ -103,4 +108,20 @@ fn self_update() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_root_dir_is_current_dir() {
+        assert_eq!(root_dir(None).unwrap(), std::env::current_dir().unwrap());
+    }
+
+    #[test]
+    fn cli_root_overrides_current_dir() {
+        let root = PathBuf::from("/tmp/my-repos");
+        assert_eq!(root_dir(Some(root.clone())).unwrap(), root);
+    }
 }
