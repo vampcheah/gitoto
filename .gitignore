@@ -3,3 +3,5 @@
 .DS_Store
 package-lock.json
 .claude/
+.codegraph/
+.serena/
