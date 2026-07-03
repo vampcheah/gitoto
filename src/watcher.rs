@@ -4,6 +4,7 @@ use notify_debouncer_full::{
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use walkdir::WalkDir;
@@ -11,7 +12,7 @@ use walkdir::WalkDir;
 use crate::event::Event;
 
 pub(crate) struct RepoWatcher {
-    _debouncer: Debouncer<RecommendedWatcher, NoCache>,
+    _debouncer: Arc<Mutex<Debouncer<RecommendedWatcher, NoCache>>>,
 }
 
 impl RepoWatcher {
@@ -63,7 +64,7 @@ impl RepoWatcher {
 
         let config = Config::default().with_poll_interval(Duration::from_secs(2));
 
-        let mut debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
+        let debouncer = new_debouncer_opt::<_, RecommendedWatcher, NoCache>(
             Duration::from_millis(debounce_ms),
             None,
             move |result: DebounceEventResult| {
@@ -89,32 +90,44 @@ impl RepoWatcher {
         // creation still fires on the watched parent and triggers a rescan, but
         // edits deep inside a brand-new subtree are missed until restart. Add a
         // watch-on-create channel if users report that.
+        // Register watches on a background thread: walking every repo subtree
+        // and installing tens of thousands of inotify watches can take tens of
+        // seconds, and doing it inline blocks the first frame. The local status
+        // poll covers changes until registration catches up.
+        let debouncer = Arc::new(Mutex::new(debouncer));
         let watch_excludes: HashSet<String> = watch_exclude_dirs.iter().cloned().collect();
-        let mut watched = 0usize;
-        for root in &owned_paths {
-            if !root.exists() {
-                continue;
-            }
-            for entry in WalkDir::new(root)
-                .into_iter()
-                .filter_entry(|e| keep_dir(e, &watch_excludes))
-                .flatten()
-            {
-                if !entry.file_type().is_dir() {
+        let walker = Arc::clone(&debouncer);
+        std::thread::spawn(move || {
+            let mut watched = 0usize;
+            for root in &owned_paths {
+                if !root.exists() {
                     continue;
                 }
-                if let Err(e) = debouncer.watch(entry.path(), RecursiveMode::NonRecursive) {
-                    tracing::warn!("Failed to watch {}: {}", entry.path().display(), e);
-                } else {
-                    watched += 1;
+                for entry in WalkDir::new(root)
+                    .into_iter()
+                    .filter_entry(|e| keep_dir(e, &watch_excludes))
+                    .flatten()
+                {
+                    if !entry.file_type().is_dir() {
+                        continue;
+                    }
+                    let result = walker
+                        .lock()
+                        .expect("watcher mutex poisoned")
+                        .watch(entry.path(), RecursiveMode::NonRecursive);
+                    if let Err(e) = result {
+                        tracing::warn!("Failed to watch {}: {}", entry.path().display(), e);
+                    } else {
+                        watched += 1;
+                    }
                 }
             }
-        }
-        tracing::info!(
-            "Watching {} dirs across {} repos",
-            watched,
-            owned_paths.len()
-        );
+            tracing::info!(
+                "Watching {} dirs across {} repos",
+                watched,
+                owned_paths.len()
+            );
+        });
 
         Ok(Self {
             _debouncer: debouncer,

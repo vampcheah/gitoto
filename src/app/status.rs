@@ -27,7 +27,10 @@ impl App {
         failure: StatusFailure,
     ) {
         let tx = self.action_tx.clone();
-        let sem = self.poll_semaphore.clone();
+        let sem = match query {
+            StatusQuery::Local => self.poll_semaphore.clone(),
+            StatusQuery::Fetch => self.fetch_semaphore.clone(),
+        };
         let ignore_dirty_subs = self.config.submodules.ignore_dirty;
         let untracked = self.effective_untracked_mode();
         let github_hosts = self.config.github.hosts.clone();
@@ -115,6 +118,54 @@ impl App {
         });
     }
 
+    /// Handles `Action::RepoStatusUpdated` by value: the status (with its
+    /// potentially large file list) moves into the repo list instead of
+    /// being cloned, and files are cloned once only for the selected repo.
+    pub(super) fn handle_repo_status_updated(
+        &mut self,
+        id: RepoId,
+        status: crate::git::status::RepoStatus,
+    ) -> Result<()> {
+        self.pending_status.remove(&id);
+        let is_dirty = self.dirty_repos.remove(&id);
+        if let Some(idx) = self.repo_list.resolve_index(&id) {
+            let repo_path = self.repo_list.repos[idx].path.clone();
+            let graph_changed = self.repo_graph_changed(repo_path.clone(), &status.graph_key);
+            let remote_changed = self.repo_remote_changed(repo_path.clone(), &status.remote_key);
+            let selected_repo =
+                self.repo_list.selected_index() == Some(idx) && self.active_worktree.is_none();
+            let selected_files = selected_repo.then(|| status.files.clone());
+            let selected_name = self.repo_display_name(idx);
+            self.repo_list.update_status(idx, status);
+
+            if selected_repo {
+                self.file_list.set_files(
+                    selected_files.unwrap_or_default(),
+                    &selected_name,
+                    id.clone(),
+                );
+
+                if graph_changed {
+                    if self.git_graph.has_detail() {
+                        self.git_graph.set_needs_reload();
+                    } else {
+                        self.git_graph.load_repo(repo_path, &selected_name);
+                    }
+                } else if self.git_graph.current_generation() == 0 {
+                    self.git_graph.load_repo(repo_path, &selected_name);
+                } else if remote_changed {
+                    self.git_graph.refresh_pushed_status();
+                }
+            } else if remote_changed {
+                self.git_graph.refresh_pushed_status_for_path(repo_path);
+            }
+        }
+        if is_dirty {
+            self.action_tx.send(Action::RefreshRepo(id))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn handle_status_action(&mut self, action: &Action) -> Result<bool> {
         match action {
             Action::SelectWorktree {
@@ -134,7 +185,9 @@ impl App {
                     path: worktree_path.clone(),
                     repo_id: repo_id.clone(),
                     display_name: display_name.clone(),
-                    graph_key: crate::git::status::graph_cache_key(worktree_path).ok(),
+                    // Filled by the async status query below; computing it here
+                    // would run git2 on the UI thread.
+                    graph_key: None,
                 });
 
                 self.file_list
@@ -162,14 +215,15 @@ impl App {
                     self.file_list
                         .set_files(files.clone(), name, repo_id.clone());
 
+                    // A None baseline means this is the first query result, not a change.
                     let graph_changed = self
                         .active_worktree
                         .as_ref()
-                        .is_some_and(|aw| aw.graph_key.as_deref() != Some(graph_key));
+                        .is_some_and(|aw| aw.graph_key.as_deref().is_some_and(|k| k != graph_key));
+                    if let Some(aw) = self.active_worktree.as_mut() {
+                        aw.graph_key = Some(graph_key.clone());
+                    }
                     if graph_changed {
-                        if let Some(aw) = self.active_worktree.as_mut() {
-                            aw.graph_key = Some(graph_key.clone());
-                        }
                         if self.git_graph.has_detail() {
                             self.git_graph.set_needs_reload();
                         } else {
@@ -185,48 +239,6 @@ impl App {
                     entry.git_op = false;
                 }
                 if self.dirty_repos.remove(id) {
-                    self.action_tx.send(Action::RefreshRepo(id.clone()))?;
-                }
-                Ok(true)
-            }
-            Action::RepoStatusUpdated { id, status } => {
-                self.pending_status.remove(id);
-                let is_dirty = self.dirty_repos.remove(id);
-                if let Some(idx) = self.repo_list.resolve_index(id) {
-                    let repo_path = self.repo_list.repos[idx].path.clone();
-                    let graph_changed =
-                        self.repo_graph_changed(repo_path.clone(), &status.graph_key);
-                    let remote_changed =
-                        self.repo_remote_changed(repo_path.clone(), &status.remote_key);
-                    let selected_repo = self.repo_list.selected_index() == Some(idx)
-                        && self.active_worktree.is_none();
-                    let selected_files = selected_repo.then(|| status.files.clone());
-                    let selected_name = self.repo_display_name(idx);
-                    self.repo_list.update_status(idx, status.clone());
-
-                    if selected_repo {
-                        self.file_list.set_files(
-                            selected_files.unwrap_or_default(),
-                            &selected_name,
-                            id.clone(),
-                        );
-
-                        if graph_changed {
-                            if self.git_graph.has_detail() {
-                                self.git_graph.set_needs_reload();
-                            } else {
-                                self.git_graph.load_repo(repo_path, &selected_name);
-                            }
-                        } else if self.git_graph.current_generation() == 0 {
-                            self.git_graph.load_repo(repo_path, &selected_name);
-                        } else if remote_changed {
-                            self.git_graph.refresh_pushed_status();
-                        }
-                    } else if remote_changed {
-                        self.git_graph.refresh_pushed_status_for_path(repo_path);
-                    }
-                }
-                if is_dirty {
                     self.action_tx.send(Action::RefreshRepo(id.clone()))?;
                 }
                 Ok(true)

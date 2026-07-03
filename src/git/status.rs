@@ -323,11 +323,6 @@ fn mark_submodule_file(files: &mut Vec<FileEntry>, sub_path: PathBuf, state: Sub
     }
 }
 
-pub(crate) fn graph_cache_key(path: &Path) -> color_eyre::Result<String> {
-    let repo = Repository::open(path)?;
-    Ok(graph_cache_key_from_repo(&repo))
-}
-
 fn graph_cache_key_from_repo(repo: &Repository) -> String {
     let mut parts = Vec::new();
 

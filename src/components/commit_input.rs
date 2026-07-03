@@ -10,6 +10,8 @@ pub(crate) struct CommitInput {
     pub visible: bool,
     repo_id: Option<RepoId>,
     repo_name: String,
+    /// Number of files marked for a partial commit; 0 means commit all.
+    marked_count: usize,
     input: SingleLineInput,
 }
 
@@ -19,14 +21,16 @@ impl CommitInput {
             visible: false,
             repo_id: None,
             repo_name: String::new(),
+            marked_count: 0,
             input: SingleLineInput::new(),
         }
     }
 
-    pub fn show(&mut self, repo_id: RepoId, repo_name: String) {
+    pub fn show(&mut self, repo_id: RepoId, repo_name: String, marked_count: usize) {
         self.visible = true;
         self.repo_id = Some(repo_id);
         self.repo_name = repo_name;
+        self.marked_count = marked_count;
         self.input.clear();
     }
 
@@ -55,11 +59,15 @@ impl CommitInput {
             return;
         }
 
-        self.input.draw(
-            frame,
-            area,
-            format!(" Commit {}: ", self.repo_name),
-            " Message (Enter: git add . && commit, Esc: cancel) ",
-        );
+        let title = if self.marked_count > 0 {
+            format!(
+                " Message (Enter: commit {} marked file(s), Esc: cancel) ",
+                self.marked_count
+            )
+        } else {
+            " Message (Enter: git add . && commit, Esc: cancel) ".to_string()
+        };
+        self.input
+            .draw(frame, area, format!(" Commit {}: ", self.repo_name), &title);
     }
 }

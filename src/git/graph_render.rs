@@ -99,8 +99,8 @@ pub(crate) fn render_branch_labels(labels: &[BranchLabel], max_len: usize) -> Ve
             spans.push(fg_span(prefix.to_string(), color));
         }
 
-        let name = if label.name.len() > max_len {
-            let mut truncated = label.name[..max_len].to_string();
+        let name = if label.name.chars().count() > max_len {
+            let mut truncated: String = label.name.chars().take(max_len).collect();
             truncated.push('\u{2026}'); // …
             truncated
         } else {
@@ -367,6 +367,20 @@ mod tests {
     fn test_empty_labels_returns_empty() {
         let spans = render_branch_labels(&[], 24);
         assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn test_label_truncation_multibyte_no_panic() {
+        // Byte-slicing this name at 24 would split a 3-byte char and panic
+        let labels = vec![label(
+            "origin/功能分支名称很长的多字节测试超过上限",
+            false,
+            true,
+            false,
+        )];
+        let spans = render_branch_labels(&labels, 24);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('\u{2026}'), "got: {text}");
     }
 
     #[test]

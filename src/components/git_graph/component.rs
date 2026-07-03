@@ -262,7 +262,7 @@ impl Component for GitGraph {
                 self.graph_list_area.y + self.graph_list_area.height.saturating_sub(1),
                 self.graph_list_area
                     .width
-                    .min(overlay_text.len() as u16 + 2),
+                    .min(ratatui::text::Span::raw(overlay_text.as_str()).width() as u16 + 2),
                 1,
             );
             let overlay =

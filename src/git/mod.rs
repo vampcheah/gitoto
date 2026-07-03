@@ -56,6 +56,40 @@ pub(crate) fn commit_all(repo_path: &Path, message: &str, no_verify: bool) -> Re
     run_git(repo_path, &args)
 }
 
+/// Commit only the given paths: stages them, then commits with a pathspec so
+/// other staged or dirty files stay untouched.
+pub(crate) fn commit_paths(
+    repo_path: &Path,
+    message: &str,
+    no_verify: bool,
+    paths: &[std::path::PathBuf],
+) -> Result<String> {
+    if message.trim().is_empty() {
+        return Err(eyre!("commit message is empty"));
+    }
+    if paths.is_empty() {
+        return Err(eyre!("no files marked"));
+    }
+
+    let path_args: Vec<String> = paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+
+    let mut add_args: Vec<String> = vec!["add".into(), "--".into()];
+    add_args.extend(path_args.iter().cloned());
+    run_git_args(repo_path, &add_args)?;
+
+    let mut args: Vec<String> = vec!["commit".into()];
+    if no_verify {
+        args.push("--no-verify".into());
+    }
+    args.extend(["-m".into(), message.to_string()]);
+    args.push("--".into());
+    args.extend(path_args);
+    run_git_args(repo_path, &args)
+}
+
 pub(crate) fn push(repo_path: &Path) -> Result<String> {
     run_git(repo_path, &["push"])
 }
@@ -235,4 +269,37 @@ fn github_remote_name(repo_path: &Path) -> Result<String> {
     Err(eyre!(
         "cannot add GitHub remote: both 'origin' and 'github' already exist"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::test_support::init_repo_with_commit;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_commit_paths_commits_only_marked_files() {
+        let (tmp, repo) = init_repo_with_commit();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+
+        std::fs::write(tmp.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(tmp.path().join("skip.txt"), "skip").unwrap();
+
+        commit_paths(tmp.path(), "partial", false, &[PathBuf::from("keep.txt")]).unwrap();
+
+        let statuses = repo.statuses(None).unwrap();
+        let dirty: Vec<String> = statuses
+            .iter()
+            .filter_map(|s| s.path().map(str::to_string))
+            .collect();
+        assert_eq!(dirty, vec!["skip.txt".to_string()]);
+    }
+
+    #[test]
+    fn test_commit_paths_rejects_empty_selection() {
+        let (tmp, _repo) = init_repo_with_commit();
+        assert!(commit_paths(tmp.path(), "msg", false, &[]).is_err());
+    }
 }

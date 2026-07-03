@@ -104,6 +104,10 @@ pub(crate) struct App {
     help_page: usize,
     /// Limits concurrent poll/refresh tasks to avoid CPU spikes
     poll_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Separate pool for fetch polls so slow fetches (up to 30s timeout each)
+    /// can't starve local status refreshes.
+    // ponytail: same size as the local pool; add a config knob if it needs tuning
+    fetch_semaphore: Arc<tokio::sync::Semaphore>,
     /// Repos with an in-flight status query (prevents duplicate spawns)
     pending_status: HashSet<RepoId>,
     /// Repos that changed while a status query was in-flight (re-queued on completion)
@@ -141,6 +145,9 @@ impl App {
         let poll_semaphore = Arc::new(tokio::sync::Semaphore::new(
             config.watch.max_concurrent_polls,
         ));
+        let fetch_semaphore = Arc::new(tokio::sync::Semaphore::new(
+            config.watch.max_concurrent_polls,
+        ));
 
         Self {
             config,
@@ -174,6 +181,7 @@ impl App {
             show_help: false,
             help_page: 0,
             poll_semaphore,
+            fetch_semaphore,
             pending_status: HashSet::new(),
             dirty_repos: HashSet::new(),
             graph_keys: HashMap::new(),
@@ -371,6 +379,13 @@ impl App {
             // Process actions
             while let Ok(action) = self.action_rx.try_recv() {
                 let render_after = !matches!(&action, Action::Tick);
+                // Taken by value so the (possibly large) status moves into the
+                // repo list instead of being cloned out of a borrowed action.
+                if let Action::RepoStatusUpdated { id, status } = action {
+                    self.handle_repo_status_updated(id, status)?;
+                    render_requested = true;
+                    continue;
+                }
                 if self.handle_git_action(&action)?
                     || self.handle_repo_action(&action)?
                     || self.handle_status_action(&action)?
@@ -477,7 +492,8 @@ impl App {
                     Action::StartCommit(ref id) => {
                         self.context_menu.hide();
                         if let Some(name) = self.repo_list.display_name_for_id(id) {
-                            self.commit_input.show(id.clone(), name);
+                            let marked = self.file_list.marked_paths_for(id).len();
+                            self.commit_input.show(id.clone(), name, marked);
                         }
                     }
                     Action::CancelCommit => {
@@ -527,15 +543,32 @@ impl App {
                         if let Some(idx) = self.repo_list.resolve_index(&repo_id) {
                             let repo_name = self.repo_display_name(idx);
                             let no_verify = self.config.commit.no_verify;
+                            let marked = self.file_list.marked_paths_for(&repo_id);
                             self.commit_input.hide();
-                            self.spawn_repo_operation(
-                                idx,
-                                &repo_id,
-                                format!("Committing {repo_name}..."),
-                                move |path| crate::git::commit_all(&path, &message, no_verify),
-                                move |_| format!("Committed {}", repo_name),
-                                Some("Commit failed"),
-                            );
+                            if marked.is_empty() {
+                                self.spawn_repo_operation(
+                                    idx,
+                                    &repo_id,
+                                    format!("Committing {repo_name}..."),
+                                    move |path| crate::git::commit_all(&path, &message, no_verify),
+                                    move |_| format!("Committed {}", repo_name),
+                                    Some("Commit failed"),
+                                );
+                            } else {
+                                let count = marked.len();
+                                self.spawn_repo_operation(
+                                    idx,
+                                    &repo_id,
+                                    format!("Committing {count} file(s) in {repo_name}..."),
+                                    move |path| {
+                                        crate::git::commit_paths(
+                                            &path, &message, no_verify, &marked,
+                                        )
+                                    },
+                                    move |_| format!("Committed {count} file(s) in {repo_name}"),
+                                    Some("Commit failed"),
+                                );
+                            }
                         }
                     }
                     Action::GitOpComplete {

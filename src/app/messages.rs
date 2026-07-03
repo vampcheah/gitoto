@@ -16,8 +16,9 @@ impl App {
             .chars()
             .map(|c| if c == '\n' { ' ' } else { c })
             .collect();
-        let truncated = if clean.len() > 120 {
-            format!("{}...", &clean[..117])
+        let truncated = if clean.chars().count() > 120 {
+            let head: String = clean.chars().take(117).collect();
+            format!("{head}...")
         } else {
             clean
         };

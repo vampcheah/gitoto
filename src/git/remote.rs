@@ -49,9 +49,18 @@ fn github_web_url_from_remote(url: &str, hosts: &[String]) -> Option<String> {
         .trim_end_matches('/')
         .trim_end_matches(".git");
     let mut parts = path.split('/');
-    let owner = parts.next().filter(|part| !part.is_empty())?;
-    let repo = parts.next().filter(|part| !part.is_empty())?;
+    let owner = parts.next().filter(|part| is_safe_url_segment(part))?;
+    let repo = parts.next().filter(|part| is_safe_url_segment(part))?;
     Some(format!("https://{host}/{owner}/{repo}"))
+}
+
+// GitHub owner/repo names only allow these; also keeps shell metachars out of
+// the URL handed to the OS opener (`cmd /C start` on Windows).
+fn is_safe_url_segment(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn split_git_remote(url: &str) -> Option<(&str, &str)> {
@@ -125,6 +134,9 @@ mod tests {
             );
         }
         assert_remote_url("git@example.com:owner/repo.git", &["github.com"], None);
+        // Shell metacharacters in owner/repo must not reach the OS URL opener
+        assert_remote_url("https://github.com/owner/re&po.git", &["github.com"], None);
+        assert_remote_url("git@github.com:own er/repo.git", &["github.com"], None);
     }
 
     #[test]

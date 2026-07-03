@@ -155,6 +155,7 @@ pub(super) fn copy_to_clipboard(text: &str) {
 pub(super) fn is_valid_github_repo_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
+        && !name.starts_with('-')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))

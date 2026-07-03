@@ -37,7 +37,7 @@ impl App {
                         .unwrap_or_else(|| path.to_string_lossy().to_string());
                     self.config.add_pinned_repo(path.clone());
                     if let Err(e) = self.config.save() {
-                        tracing::error!("Failed to save config: {}", e);
+                        self.set_error_message(format!("Failed to save config: {e}"));
                     }
                     let repo_id = RepoId(path.clone());
                     self.repo_list.push_repo(RepoEntry {
@@ -65,7 +65,7 @@ impl App {
                         self.config.excluded_repos.push(exclusion_name);
                     }
                     if let Err(e) = self.config.save() {
-                        tracing::error!("Failed to save config: {}", e);
+                        self.set_error_message(format!("Failed to save config: {e}"));
                     }
 
                     self.repo_list.remove_repo(idx);
@@ -97,7 +97,7 @@ impl App {
 
                 self.config.excluded_repos.clear();
                 if let Err(e) = self.config.save() {
-                    tracing::error!("Failed to save config: {}", e);
+                    self.set_error_message(format!("Failed to save config: {e}"));
                 }
                 let repo_paths = scanner::discover_repos(&self.config);
                 self.repo_list = RepoList::new(

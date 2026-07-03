@@ -29,8 +29,13 @@ pub(crate) fn commit_file_item(status: &str, path: &str) -> ListItem<'static> {
     ]))
 }
 
-pub(crate) fn worktree_file_item(entry: &FileEntry) -> ListItem<'static> {
-    let mut spans = vec![status_span(entry.status.label())];
+pub(crate) fn worktree_file_item(entry: &FileEntry, marked: bool) -> ListItem<'static> {
+    let mark = if marked {
+        bold_fg_span("✓".to_string(), Color::Green)
+    } else {
+        Span::raw(" ")
+    };
+    let mut spans = vec![mark, status_span(entry.status.label())];
     if entry.is_submodule {
         spans.push(fg_span(
             submodule_label(entry.submodule_state),

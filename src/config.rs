@@ -302,7 +302,9 @@ impl Config {
             std::fs::create_dir_all(parent)?;
         }
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(config_path, contents)?;
+        let tmp_path = config_path.with_extension("toml.tmp");
+        std::fs::write(&tmp_path, contents)?;
+        std::fs::rename(&tmp_path, config_path)?;
         Ok(())
     }
 

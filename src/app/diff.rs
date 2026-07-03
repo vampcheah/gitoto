@@ -248,6 +248,6 @@ fn file_diff_body(path: &Path, file_path: &Path) -> String {
 }
 
 fn new_file_diff_body(path: &Path, file_path: &Path) -> String {
-    crate::git::git_stdout_with_path(path, &["diff", "--no-index", "/dev/null"], file_path)
+    crate::git::git_stdout_with_path(path, &["diff", "--no-index", "--", "/dev/null"], file_path)
         .unwrap_or_default()
 }

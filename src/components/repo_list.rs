@@ -507,24 +507,32 @@ impl Component for RepoList {
         }
     }
 
-    fn update(&mut self, action: Action) -> Result<Option<Action>> {
-        match action {
-            Action::RepoStatusUpdated { ref id, ref status } => {
-                if let Some(idx) = self.resolve_index(id) {
-                    self.update_status(idx, status.clone());
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         self.render_area = area;
         self.ensure_display_rows();
 
-        let items: Vec<ListItem> = self
-            .display_rows
+        let border_color = if self.focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
+        let block = panel::bordered_block(" Repositories ".to_string(), border_color);
+
+        // Only build items for the visible window (same pattern as git_graph).
+        let rows_len = self.display_rows.len();
+        let visible = area.height.saturating_sub(2).max(1) as usize;
+        let selected = self
+            .state
+            .selected()
+            .map(|s| s.min(rows_len.saturating_sub(1)));
+        let anchor = selected.unwrap_or(0);
+        let max_start = rows_len.saturating_sub(visible);
+        let start = anchor.saturating_sub(visible / 2).min(max_start);
+        let end = (start + visible).min(rows_len);
+        // Keep the real state's offset in sync for mouse-click row mapping.
+        *self.state.offset_mut() = start;
+
+        let items: Vec<ListItem> = self.display_rows[start..end]
             .iter()
             .filter_map(|row| match row {
                 DisplayRow::Repo(i) => Some(self.render_repo_item(&self.repos[*i], *i)),
@@ -532,14 +540,13 @@ impl Component for RepoList {
             })
             .collect();
 
-        let border_color = if self.focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
-
-        let block = panel::bordered_block(" Repositories ".to_string(), border_color);
-        frame.render_stateful_widget(panel::highlighted_list(items, block), area, &mut self.state);
+        let mut render_state = ListState::default();
+        render_state.select(selected.map(|s| s - start));
+        frame.render_stateful_widget(
+            panel::highlighted_list(items, block),
+            area,
+            &mut render_state,
+        );
         Ok(())
     }
 }

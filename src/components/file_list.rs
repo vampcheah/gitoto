@@ -19,9 +19,12 @@ use crate::components::selection;
 use crate::components::style::fg_style;
 use crate::git::status::FileEntry;
 use crate::repo_id::RepoId;
+use std::path::PathBuf;
 
 pub(crate) struct FileList {
     files: Vec<FileEntry>,
+    /// Files marked (Space) for a partial commit; empty means commit all.
+    marked: std::collections::HashSet<PathBuf>,
     state: ListState,
     repo_name: String,
     repo_id: Option<RepoId>,
@@ -42,6 +45,7 @@ impl FileList {
     pub fn new() -> Self {
         Self {
             files: Vec::new(),
+            marked: std::collections::HashSet::new(),
             state: ListState::default(),
             repo_name: String::new(),
             repo_id: None,
@@ -62,6 +66,13 @@ impl FileList {
         let prev_selected = self.state.selected();
         let files_changed = !is_same_repo || self.files != files;
 
+        if is_same_repo {
+            // Committed/reverted files vanish from the list; drop their marks.
+            self.marked
+                .retain(|path| files.iter().any(|f| f.path == *path));
+        } else {
+            self.marked.clear();
+        }
         self.files = files;
         self.repo_name = repo_name.to_string();
         self.repo_id = Some(repo_id);
@@ -99,6 +110,25 @@ impl FileList {
         self.diff_generation
     }
 
+    /// Marked file paths for a partial commit, only if they belong to `repo_id`.
+    pub fn marked_paths_for(&self, repo_id: &RepoId) -> Vec<PathBuf> {
+        if self.repo_id.as_ref() != Some(repo_id) {
+            return Vec::new();
+        }
+        let mut paths: Vec<PathBuf> = self.marked.iter().cloned().collect();
+        paths.sort();
+        paths
+    }
+
+    fn toggle_mark(&mut self) {
+        let Some(file) = self.state.selected().and_then(|i| self.files.get(i)) else {
+            return;
+        };
+        if !self.marked.remove(&file.path) {
+            self.marked.insert(file.path.clone());
+        }
+    }
+
     fn try_show_diff(&mut self) -> Option<Action> {
         let idx = self.state.selected()?;
         let repo_id = self.repo_id.clone()?;
@@ -116,8 +146,14 @@ impl FileList {
 
         let title = if self.repo_name.is_empty() {
             " Changes ".to_string()
-        } else {
+        } else if self.marked.is_empty() {
             format!(" Changes — {} ", self.repo_name)
+        } else {
+            format!(
+                " Changes — {} ({} marked) ",
+                self.repo_name,
+                self.marked.len()
+            )
         };
 
         let block = panel::bordered_block(title, border_color);
@@ -138,7 +174,9 @@ impl FileList {
         let items: Vec<ListItem> = self
             .files
             .iter()
-            .map(file_status_view::worktree_file_item)
+            .map(|entry| {
+                file_status_view::worktree_file_item(entry, self.marked.contains(&entry.path))
+            })
             .collect();
 
         frame.render_stateful_widget(panel::highlighted_list(items, block), area, &mut self.state);
@@ -181,6 +219,10 @@ impl Component for FileList {
         match key.code {
             _ if selection::handle_vertical_key(&mut self.state, self.files.len(), key) => Ok(None),
             KeyCode::Enter => Ok(self.try_show_diff()),
+            KeyCode::Char(' ') => {
+                self.toggle_mark();
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
