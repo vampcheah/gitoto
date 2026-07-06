@@ -208,6 +208,11 @@ impl App {
         if let Some(idx) = self.repo_list.selected_index() {
             let repo_id = self.repo_list.repos[idx].id();
             self.load_repo_panels(idx, repo_id);
+        } else {
+            // No repos left (e.g. rescan after .git was deleted): clear stale panels.
+            self.file_list
+                .set_files(Vec::new(), "", RepoId(std::path::PathBuf::new()));
+            self.git_graph.clear();
         }
     }
 

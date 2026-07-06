@@ -71,8 +71,7 @@ impl App {
                     self.repo_list.remove_repo(idx);
                     if self.repo_list.repos.is_empty() {
                         self.repo_list.state.select(None);
-                        self.file_list
-                            .set_files(Vec::new(), "", RepoId(std::path::PathBuf::new()));
+                        self.sync_selection();
                     } else {
                         let new_idx = idx.min(self.repo_list.repos.len() - 1);
                         self.repo_list.select_repo_row(new_idx);

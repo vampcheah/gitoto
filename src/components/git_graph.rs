@@ -148,6 +148,28 @@ impl GitGraph {
         });
     }
 
+    /// Reset to the empty "no repo" state (e.g. after a rescan finds nothing).
+    pub fn clear(&mut self) {
+        self.repo_name.clear();
+        self.repo_path = None;
+        self.rows.clear();
+        self.all_rows.clear();
+        self.state.select(None);
+        self.commit_detail = None;
+        self.error = None;
+        self.loading = false;
+        self.needs_reload = false;
+        self.search.clear();
+        self.collapsed_branches.clear();
+        self.segments.clear();
+        self.row_to_segment.clear();
+        self.diff_stat_cache.clear();
+        self.pending_diff_stats.clear();
+        // Invalidate any in-flight GraphLoaded/DiffStatsLoaded results.
+        self.load_generation += 1;
+        self.detail_generation += 1;
+    }
+
     pub fn set_error(&mut self, msg: String) {
         self.error = Some(msg);
         self.loading = false;
