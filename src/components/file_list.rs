@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Rect},
     style::Color,
-    widgets::{ListItem, ListState, Paragraph},
+    widgets::{Clear, ListItem, ListState, Paragraph},
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -323,6 +323,7 @@ impl Component for FileList {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         self.render_area = area;
+        frame.render_widget(Clear, area);
 
         if self.diff_content.is_some() {
             // Split: file list 40% | diff 60%

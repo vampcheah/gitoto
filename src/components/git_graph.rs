@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Color,
     text::Line,
-    widgets::{ListItem, ListState, Paragraph, Wrap},
+    widgets::{Clear, ListItem, ListState, Paragraph, Wrap},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -513,6 +513,7 @@ impl GitGraph {
     }
 
     fn draw_graph_list(&mut self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(Clear, area);
         let collapsed_count = self.collapsed_branches.len();
         let title = match (self.graph_options.first_parent, collapsed_count) {
             (true, 0) => format!(" Git Graph — {} [1st-parent] ", self.repo_name),

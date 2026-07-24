@@ -136,6 +136,8 @@ impl App {
         self.file_list.horizontal_layout = false;
         self.git_graph.horizontal_layout = false;
 
+        frame.render_widget(Clear, main_area);
+
         self.repo_list.draw(frame, repo_area)?;
         self.file_list.draw(frame, changes_area)?;
         self.git_graph.draw(frame, graph_area)?;

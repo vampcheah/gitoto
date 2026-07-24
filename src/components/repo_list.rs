@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::Color,
     text::{Line, Span},
-    widgets::{ListItem, ListState},
+    widgets::{Clear, ListItem, ListState},
 };
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -509,6 +509,7 @@ impl Component for RepoList {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) -> Result<()> {
         self.render_area = area;
+        frame.render_widget(Clear, area);
         self.ensure_display_rows();
 
         let border_color = if self.focused {
