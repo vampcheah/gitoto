@@ -255,6 +255,26 @@ impl App {
                 }
                 Ok(true)
             }
+            Action::RunRevertFile { id, path } => {
+                if let Some(idx) = self.repo_list.resolve_index(id) {
+                    let display_name = self.action_repo_name(idx);
+                    let filename = path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let target_path = path.clone();
+                    self.spawn_repo_operation(
+                        idx,
+                        id,
+                        format!("Reverting {filename} in {display_name}..."),
+                        move |repo_path| crate::git::revert_file(&repo_path, &target_path),
+                        move |msg| msg,
+                        Some("Revert file failed"),
+                    );
+                }
+                Ok(true)
+            }
             _ => Ok(false),
         }
     }

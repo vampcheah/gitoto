@@ -17,7 +17,7 @@ use crate::components::style::{bold_fg_span, fg_style};
 use crate::git::status::RepoStatus;
 use crate::repo_id::RepoId;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum MenuAction {
     OpenGraph,
     Refresh,
@@ -35,6 +35,8 @@ enum MenuAction {
     SubmoduleUpdate,
     SubmoduleSync,
     SubmoduleUpdateLatest,
+    RevertFile(std::path::PathBuf),
+    CopyFilePath(std::path::PathBuf),
 }
 
 impl MenuAction {
@@ -56,17 +58,19 @@ impl MenuAction {
             Self::SubmoduleUpdate => Action::GitSubmoduleUpdate(id),
             Self::SubmoduleSync => Action::GitSubmoduleSync(id),
             Self::SubmoduleUpdateLatest => Action::GitSubmoduleUpdateLatest(id),
+            Self::RevertFile(path) => Action::RevertFile { id, path },
+            Self::CopyFilePath(path) => Action::CopyFilePath(path),
         }
     }
 
-    fn style(self) -> Style {
+    fn style(&self) -> Style {
         match self {
             Self::Push => fg_style(Color::Green),
             Self::Commit | Self::Publish | Self::CreateGithubPrivate | Self::CreateGithubPublic => {
                 fg_style(Color::Cyan)
             }
             Self::Pull | Self::PullRebase | Self::PullSubmodules => fg_style(Color::Yellow),
-            Self::RemoveOriginRemote => fg_style(Color::Red),
+            Self::RemoveOriginRemote | Self::RevertFile(_) => fg_style(Color::Red),
             Self::SubmoduleUpdate | Self::SubmoduleSync | Self::SubmoduleUpdateLatest => {
                 fg_style(Color::LightMagenta)
             }
@@ -250,6 +254,36 @@ impl ContextMenu {
         self.select_first_action();
     }
 
+    pub fn show_for_file(
+        &mut self,
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        col: u16,
+        row: u16,
+    ) {
+        self.visible = true;
+        self.repo_id = Some(repo_id);
+        self.position = (col, row);
+
+        let filename = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        let mut items = Vec::new();
+        push_section(
+            &mut items,
+            "File",
+            [
+                (format!("Revert {filename}"), MenuAction::RevertFile(path.clone())),
+                ("Copy path".to_string(), MenuAction::CopyFilePath(path)),
+            ],
+        );
+
+        self.items = items;
+        self.select_first_action();
+    }
+
     pub fn hide(&mut self) {
         self.visible = false;
     }
@@ -285,7 +319,7 @@ impl ContextMenu {
         let idx = self.state.selected()?;
         let item = self.items.get(idx)?;
         let id = self.repo_id.clone()?;
-        let action = item.action?.into_action(id);
+        let action = item.action.clone()?.into_action(id);
         self.hide();
         Some(action)
     }

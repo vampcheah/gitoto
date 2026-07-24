@@ -223,6 +223,18 @@ impl Component for FileList {
                 self.toggle_mark();
                 Ok(None)
             }
+            KeyCode::Char('x') | KeyCode::Char('u') => {
+                if let Some(idx) = self.state.selected()
+                    && let Some(file) = self.files.get(idx)
+                    && let Some(repo_id) = &self.repo_id
+                {
+                    return Ok(Some(Action::RevertFile {
+                        id: repo_id.clone(),
+                        path: file.path.clone(),
+                    }));
+                }
+                Ok(None)
+            }
             _ => Ok(None),
         }
     }
@@ -248,6 +260,34 @@ impl Component for FileList {
                         return Ok(self.try_show_diff());
                     }
                     self.state.select(Some(idx));
+                }
+                Ok(None)
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                let click_area = if self.viewing_diff() {
+                    self.file_list_area
+                } else {
+                    self.render_area
+                };
+
+                if let Some(idx) = selection::clicked_list_index(
+                    click_area,
+                    mouse.column,
+                    mouse.row,
+                    self.state.offset(),
+                    self.files.len(),
+                ) {
+                    self.state.select(Some(idx));
+                    if let Some(file) = self.files.get(idx)
+                        && let Some(repo_id) = &self.repo_id
+                    {
+                        return Ok(Some(Action::ShowFileContextMenu {
+                            id: repo_id.clone(),
+                            path: file.path.clone(),
+                            row: mouse.row,
+                            col: mouse.column,
+                        }));
+                    }
                 }
                 Ok(None)
             }

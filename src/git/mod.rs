@@ -271,6 +271,72 @@ fn github_remote_name(repo_path: &Path) -> Result<String> {
     ))
 }
 
+pub(crate) fn revert_file(repo_path: &Path, file_path: &Path) -> Result<String> {
+    let full_path = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        repo_path.join(file_path)
+    };
+
+    let file_str = file_path.to_string_lossy().into_owned();
+
+    // 1. Try checkout HEAD -- <file_path>
+    let checkout_res = run_git_args(
+        repo_path,
+        &[
+            "checkout".into(),
+            "HEAD".into(),
+            "--".into(),
+            file_str.clone(),
+        ],
+    );
+
+    if checkout_res.is_ok() {
+        if full_path.exists() {
+            let _ = run_git_args(
+                repo_path,
+                &[
+                    "clean".into(),
+                    "-f".into(),
+                    "-d".into(),
+                    "--".into(),
+                    file_str,
+                ],
+            );
+        }
+        return Ok(format!("Reverted {}", file_path.display()));
+    }
+
+    // 2. If checkout HEAD failed (e.g. untracked file or newly added file not in HEAD):
+    let _ = run_git_args(
+        repo_path,
+        &["reset".into(), "HEAD".into(), "--".into(), file_str],
+    );
+
+    // 3. Remove untracked file or directory
+    if full_path.exists() {
+        if full_path.is_dir() {
+            std::fs::remove_dir_all(&full_path).map_err(|e| {
+                eyre!(
+                    "Failed to remove untracked directory {}: {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
+        } else {
+            std::fs::remove_file(&full_path).map_err(|e| {
+                eyre!(
+                    "Failed to remove untracked file {}: {}",
+                    file_path.display(),
+                    e
+                )
+            })?;
+        }
+    }
+
+    Ok(format!("Reverted {}", file_path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,4 +368,41 @@ mod tests {
         let (tmp, _repo) = init_repo_with_commit();
         assert!(commit_paths(tmp.path(), "msg", false, &[]).is_err());
     }
+
+    #[test]
+    fn test_revert_file_modified() {
+        let (tmp, repo) = crate::git::test_support::init_repo();
+        crate::git::test_support::write_commit(
+            &repo,
+            tmp.path(),
+            "test.txt",
+            "hello",
+            "initial",
+            &[],
+        );
+        let test_file = tmp.path().join("test.txt");
+        std::fs::write(&test_file, "modified content").unwrap();
+
+        revert_file(tmp.path(), &PathBuf::from("test.txt")).unwrap();
+
+        let content = std::fs::read_to_string(&test_file).unwrap();
+        assert_eq!(content, "hello");
+
+        let statuses = repo.statuses(None).unwrap();
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn test_revert_file_untracked() {
+        let (tmp, repo) = init_repo_with_commit();
+        let new_file = tmp.path().join("new_file.txt");
+        std::fs::write(&new_file, "new content").unwrap();
+
+        revert_file(tmp.path(), &PathBuf::from("new_file.txt")).unwrap();
+
+        assert!(!new_file.exists());
+        let statuses = repo.statuses(None).unwrap();
+        assert!(statuses.is_empty());
+    }
 }
+

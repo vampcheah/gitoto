@@ -456,6 +456,14 @@ impl App {
                             );
                         }
                     }
+                    Action::ShowFileContextMenu {
+                        ref id,
+                        ref path,
+                        row,
+                        col,
+                    } => {
+                        self.context_menu.show_for_file(id.clone(), path.clone(), col, row);
+                    }
                     Action::HideContextMenu => {
                         self.context_menu.hide();
                     }
@@ -471,6 +479,23 @@ impl App {
                             let path_str = entry.path.to_string_lossy().to_string();
                             copy_to_clipboard(&path_str);
                         }
+                    }
+                    Action::CopyFilePath(ref path) => {
+                        copy_to_clipboard(&path.to_string_lossy());
+                    }
+                    Action::RevertFile { ref id, ref path } => {
+                        self.context_menu.hide();
+                        let filename = path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string_lossy().to_string());
+                        self.confirm_dialog.show(
+                            format!("Revert changes in {filename}?"),
+                            Action::RunRevertFile {
+                                id: id.clone(),
+                                path: path.clone(),
+                            },
+                        );
                     }
                     Action::OpenGitHub(ref id) => {
                         if let Some(entry) = self.repo_list.resolve_entry(id) {

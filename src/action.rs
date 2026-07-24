@@ -51,8 +51,23 @@ pub(crate) enum Action {
         row: u16,
         col: u16,
     },
+    ShowFileContextMenu {
+        id: RepoId,
+        path: std::path::PathBuf,
+        row: u16,
+        col: u16,
+    },
     HideContextMenu,
     CopyPath(RepoId),
+    CopyFilePath(std::path::PathBuf),
+    RevertFile {
+        id: RepoId,
+        path: std::path::PathBuf,
+    },
+    RunRevertFile {
+        id: RepoId,
+        path: std::path::PathBuf,
+    },
     OpenGitHub(RepoId),
     StartCommit(RepoId),
     ConfirmCommit,
