@@ -37,8 +37,8 @@ pub(crate) fn split_three_vertical_by_fraction(
     second_end: f64,
 ) -> (Rect, Rect, Rect) {
     let height = area.height as f64;
-    let first = (first_end * height).round() as u16;
-    let second = ((second_end - first_end) * height).round() as u16;
+    let first = ((first_end * height).round() as u16).max(3);
+    let second = (((second_end - first_end) * height).round() as u16).max(3);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
