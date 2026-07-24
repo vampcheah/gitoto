@@ -118,7 +118,6 @@ impl App {
     pub(super) fn draw(&mut self, frame: &mut ratatui::Frame) -> color_eyre::Result<()> {
         let area = frame.area();
         let (main_area, status_area) = component_layout::split_with_status_bar(area);
-        frame.render_widget(Clear, main_area);
         let (repo_area, changes_area, graph_area) =
             component_layout::split_three_vertical_by_fraction(
                 main_area,

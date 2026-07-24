@@ -48,13 +48,6 @@ async fn main() -> Result<()> {
         return self_update();
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("gitoto=info".parse()?),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
     let mut config = config::Config::load()?;
 
     config.override_root(root_dir(cli.root)?);
