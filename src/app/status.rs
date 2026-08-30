@@ -133,10 +133,10 @@ impl App {
             let graph_changed = self.repo_graph_changed(repo_path.clone(), &status.graph_key);
             let remote_changed = self.repo_remote_changed(repo_path.clone(), &status.remote_key);
             let selected_repo =
-                self.repo_list.selected_index() == Some(idx) && self.active_worktree.is_none();
+                self.active_repo_id().as_ref() == Some(&id) && self.active_worktree.is_none();
             let selected_files = selected_repo.then(|| status.files.clone());
-            let selected_name = self.repo_display_name(idx);
             self.repo_list.update_status(idx, status);
+            let selected_name = self.repo_display_name(idx);
 
             if selected_repo {
                 self.file_list.set_files(

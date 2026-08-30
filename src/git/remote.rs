@@ -6,16 +6,14 @@ pub(crate) fn github_remote_url(repo: &Repository, hosts: &[String]) -> Option<S
     };
 
     remotes.iter().flatten().find_map(|name| {
-        repo.find_remote(name).ok().and_then(|remote| {
-            remote
-                .url()
-                .and_then(|url| github_web_url_from_remote(url, hosts))
-                .or_else(|| {
-                    remote
-                        .pushurl()
-                        .and_then(|url| github_web_url_from_remote(url, hosts))
-                })
-        })
+        repo.find_remote(name)
+            .ok()
+            .and_then(|remote| match remote.pushurl() {
+                Some(url) => github_web_url_from_remote(url, hosts),
+                None => remote
+                    .url()
+                    .and_then(|url| github_web_url_from_remote(url, hosts)),
+            })
     })
 }
 
@@ -164,5 +162,24 @@ mod tests {
             Some("repo")
         );
         assert_eq!(github_repo_name_from_web_url(""), None);
+    }
+
+    #[test]
+    fn test_github_remote_url_ignores_fetch_only_remotes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        repo.remote("genesisone", "https://github.com/owner/GenesisOne.git")
+            .unwrap();
+        repo.remote_set_pushurl("genesisone", Some("DISABLED"))
+            .unwrap();
+
+        assert_eq!(github_remote_url(&repo, &["github.com".into()]), None);
+
+        repo.remote("origin", "https://github.com/owner/BiteMoment.git")
+            .unwrap();
+        assert_eq!(
+            github_remote_url(&repo, &["github.com".into()]).as_deref(),
+            Some("https://github.com/owner/BiteMoment")
+        );
     }
 }
