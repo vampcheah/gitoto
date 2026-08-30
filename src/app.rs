@@ -462,7 +462,8 @@ impl App {
                         row,
                         col,
                     } => {
-                        self.context_menu.show_for_file(id.clone(), path.clone(), col, row);
+                        self.context_menu
+                            .show_for_file(id.clone(), path.clone(), col, row);
                     }
                     Action::HideContextMenu => {
                         self.context_menu.hide();

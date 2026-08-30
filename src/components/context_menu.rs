@@ -254,13 +254,7 @@ impl ContextMenu {
         self.select_first_action();
     }
 
-    pub fn show_for_file(
-        &mut self,
-        repo_id: RepoId,
-        path: std::path::PathBuf,
-        col: u16,
-        row: u16,
-    ) {
+    pub fn show_for_file(&mut self, repo_id: RepoId, path: std::path::PathBuf, col: u16, row: u16) {
         self.visible = true;
         self.repo_id = Some(repo_id);
         self.position = (col, row);
@@ -275,7 +269,10 @@ impl ContextMenu {
             &mut items,
             "File",
             [
-                (format!("Revert {filename}"), MenuAction::RevertFile(path.clone())),
+                (
+                    format!("Revert {filename}"),
+                    MenuAction::RevertFile(path.clone()),
+                ),
                 ("Copy path".to_string(), MenuAction::CopyFilePath(path)),
             ],
         );
