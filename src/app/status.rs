@@ -161,7 +161,11 @@ impl App {
             }
         }
         if is_dirty {
-            self.action_tx.send(Action::RefreshRepo(id))?;
+            let tx = self.action_tx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                let _ = tx.send(Action::RefreshRepo(id));
+            });
         }
         Ok(())
     }
@@ -239,7 +243,12 @@ impl App {
                     entry.git_op = false;
                 }
                 if self.dirty_repos.remove(id) {
-                    self.action_tx.send(Action::RefreshRepo(id.clone()))?;
+                    let id = id.clone();
+                    let tx = self.action_tx.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        let _ = tx.send(Action::RefreshRepo(id));
+                    });
                 }
                 Ok(true)
             }

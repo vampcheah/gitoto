@@ -191,15 +191,55 @@ fn default_poll_local_full_every() -> usize {
 
 fn default_watch_exclude_dirs() -> Vec<String> {
     [
+        // Package managers & dependencies
         "node_modules",
+        "vendor",
+        "Pods",
+        ".pnpm-store",
+        ".yarn",
+        // Python environments & caches
+        ".venv",
+        "venv",
+        "env",
+        ".env",
+        "virtualenv",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        ".nox",
+        // Build & compiler outputs
         "target",
+        "build",
         ".build",
         "dist",
-        "vendor",
-        ".venv",
-        "__pycache__",
+        "out",
+        "bin",
+        "obj",
+        ".output",
         ".next",
-        "Pods",
+        ".nuxt",
+        ".svelte-kit",
+        ".parcel-cache",
+        ".vite",
+        ".astro",
+        ".cache",
+        "DerivedData",
+        ".dart_tool",
+        ".pub-cache",
+        // Testing & coverage
+        "coverage",
+        ".nyc_output",
+        // IDEs & editor state
+        ".idea",
+        ".vscode",
+        ".fleet",
+        ".settings",
+        ".gradle",
+        // Tooling & diagnostics
+        ".codegraph",
+        ".serena",
     ]
     .iter()
     .map(|s| s.to_string())

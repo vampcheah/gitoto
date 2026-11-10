@@ -30,8 +30,53 @@ max_concurrent_polls = 4
 # Run a full local scan every N local polls; other local polls focus on selected/uninitialized repos (default: 12)
 poll_local_full_every = 12
 
-# Directory names ignored by filesystem watcher events
-watch_exclude_dirs = ["node_modules", "target", ".build", "dist", "vendor"]
+# Directory names, patterns, and temporary files ignored by filesystem watcher and discovery.
+# Supports wildcards like "*.tmp" or "build-*" and automatic trailing slash handling.
+watch_exclude_dirs = [
+  "node_modules",
+  "vendor",
+  "Pods",
+  ".pnpm-store",
+  ".yarn",
+  ".venv",
+  "venv",
+  "env",
+  ".env",
+  "virtualenv",
+  "__pycache__",
+  ".pytest_cache",
+  ".mypy_cache",
+  ".ruff_cache",
+  ".tox",
+  ".nox",
+  "target",
+  "build",
+  ".build",
+  "dist",
+  "out",
+  "bin",
+  "obj",
+  ".output",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".parcel-cache",
+  ".vite",
+  ".astro",
+  ".cache",
+  "DerivedData",
+  ".dart_tool",
+  ".pub-cache",
+  "coverage",
+  ".nyc_output",
+  ".idea",
+  ".vscode",
+  ".fleet",
+  ".settings",
+  ".gradle",
+  ".codegraph",
+  ".serena",
+]
 
 [ui]
 # Terminal refresh rate in frames per second (default: 10)

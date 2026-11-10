@@ -200,6 +200,9 @@ fn query_status_inner(
     // File statuses
     let mut opts = StatusOptions::new();
     opts.renames_head_to_index(true);
+    // Do not touch/refresh index stat entries during read queries to prevent
+    // modifying .git/index and triggering watcher feedback loops.
+    opts.no_refresh(true);
 
     match untracked {
         UntrackedMode::All => {

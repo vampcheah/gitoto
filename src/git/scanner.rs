@@ -56,12 +56,13 @@ fn canonical_parent(path: &Path) -> PathBuf {
 fn is_excluded_repo(repo_path: &Path, excluded_repos: &[String]) -> bool {
     let repo_name = repo_path
         .file_name()
-        .map(|name| name.to_string_lossy().to_string())
+        .map(|name| name.to_string_lossy())
         .unwrap_or_default();
     let path_str = repo_path.to_string_lossy();
-    excluded_repos
-        .iter()
-        .any(|pattern| repo_name == *pattern || path_str.contains(pattern))
+    excluded_repos.iter().any(|pattern| {
+        crate::watcher::is_pattern_match(pattern, &repo_name)
+            || path_str.contains(pattern.trim_matches(['/', '\\']))
+    })
 }
 
 fn sort_repos_with_pinned_first(repos: &mut Vec<PathBuf>, pinned_repos: &[PathBuf]) {
@@ -94,17 +95,30 @@ fn should_descend(entry: &DirEntry, config: &Config) -> bool {
     }
 
     let name = entry.file_name();
+    // Allow .git itself to be yielded so discover_repos registers the repo parent,
+    // but prune everything inside .git (objects, refs, etc.) to avoid traversing deep internals.
+    if entry.path().components().any(|c| c.as_os_str() == ".git") && name != OsStr::new(".git") {
+        return false;
+    }
     if name == OsStr::new(".git") {
         return true;
     }
 
-    let name = name.to_string_lossy();
-    !config
+    let name_str = name.to_string_lossy();
+    let excluded_by_watch = config
         .watch
         .watch_exclude_dirs
         .iter()
-        .any(|dir| dir == &name)
-        && !config.excluded_repos.iter().any(|pattern| pattern == &name)
+        .any(|pattern| crate::watcher::is_pattern_match(pattern, &name_str));
+    if excluded_by_watch {
+        return false;
+    }
+
+    let excluded_by_repo = config
+        .excluded_repos
+        .iter()
+        .any(|pattern| crate::watcher::is_pattern_match(pattern, &name_str));
+    !excluded_by_repo
 }
 
 #[cfg(test)]
@@ -204,5 +218,28 @@ mod tests {
         let repos = discover_repos(&config);
         assert_eq!(repos.len(), 1);
         assert!(repos[0].ends_with("visible"));
+    }
+
+    #[test]
+    fn test_watch_excluded_dirs_with_wildcards_and_trailing_slashes() {
+        let tmp = TempDir::new().unwrap();
+        make_repo(tmp.path(), "my-app");
+        let venv_dir = tmp.path().join("venv311");
+        fs::create_dir_all(&venv_dir).unwrap();
+        make_repo(&venv_dir, "nested-repo");
+
+        let config = Config {
+            root_dirs: vec![tmp.path().to_path_buf()],
+            scan_depth: 3,
+            watch: crate::config::WatchConfig {
+                watch_exclude_dirs: vec!["venv*".to_string(), "node_modules/".to_string()],
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let repos = discover_repos(&config);
+        assert_eq!(repos.len(), 1);
+        assert!(repos[0].ends_with("my-app"));
     }
 }
